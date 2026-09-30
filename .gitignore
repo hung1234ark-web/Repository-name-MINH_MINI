@@ -1,0 +1,13 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+*.log
+logs/
+data/
+memory/
+.venv/
+venv/
+models/
+*.gguf

@@ -1,0 +1,2961 @@
+# ============================================================
+# MINH MINI — MAIN FINAL
+# CENTRAL ORCHESTRATOR
+#
+# INPUT
+#   ↓
+# COMMAND COMPLETION
+#   ↓
+# BRAIN
+#   ↓
+# CONTEXT MANAGER
+#   ↓
+# ROUTER GUARD
+#   ↓
+# EXECUTION CONTROLLER
+#   ↓
+# ACTION / WEB / WEB AI / MEMORY / OLLAMA
+#   ↓
+# RESPONSE GUARD
+#   ↓
+# OUTPUT
+# ============================================================
+
+from __future__ import annotations
+
+from pathlib import Path
+from datetime import datetime
+from typing import Any
+import json
+import re
+import traceback
+import urllib.parse
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+APP_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path.home() / "MINH_MINI"
+
+CONFIG_DIR = BASE_DIR / "config"
+MEMORY_DIR = BASE_DIR / "memory"
+LOG_DIR = BASE_DIR / "logs"
+HISTORY_DIR = BASE_DIR / "history"
+
+CONFIG_FILE = CONFIG_DIR / "config.json"
+MEMORY_FILE = MEMORY_DIR / "memory.json"
+LOG_FILE = LOG_DIR / "conversation.log"
+HISTORY_FILE = HISTORY_DIR / "history.json"
+
+for directory in (
+    BASE_DIR,
+    CONFIG_DIR,
+    MEMORY_DIR,
+    LOG_DIR,
+    HISTORY_DIR,
+):
+    directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
+# ============================================================
+# SAFE IMPORT
+# ============================================================
+
+def safe_import(module_name: str):
+    try:
+        return __import__(module_name)
+    except Exception:
+        return None
+
+
+brain_module = safe_import("brain")
+conversation_state = safe_import("conversation_state")
+command_completion = safe_import("command_completion")
+router_guard = safe_import("router_guard")
+response_guard = safe_import("response_guard")
+execution_controller = safe_import("execution_controller")
+action = safe_import("action")
+web = safe_import("web")
+web_ai = safe_import("web_ai")
+web_context = safe_import("web_context")
+
+
+chat_module = safe_import("chat")
+# ============================================================
+# CONFIG
+# ============================================================
+
+DEFAULT_CONFIG = {
+    "ollama": {
+        "host": "http://127.0.0.1:11434",
+        "model": "qwen3:4b",
+        "timeout": 120,
+        "temperature": 0.3,
+    },
+    "web": {
+        "max_results": 10,
+        "timeout": 15,
+    },
+    "memory": {
+        "enabled": True,
+        "max_items": 500,
+    },
+    "history": {
+        "enabled": True,
+        "max_items": 500,
+    },
+}
+
+
+def deep_merge(
+    base: dict[str, Any],
+    extra: dict[str, Any],
+) -> dict[str, Any]:
+
+    result = dict(base)
+
+    for key, value in extra.items():
+
+        if (
+            key in result
+            and isinstance(result[key], dict)
+            and isinstance(value, dict)
+        ):
+            result[key] = deep_merge(
+                result[key],
+                value,
+            )
+        else:
+            result[key] = value
+
+    return result
+
+
+def load_config() -> dict[str, Any]:
+
+    if not CONFIG_FILE.exists():
+
+        save_config(DEFAULT_CONFIG)
+
+        return dict(DEFAULT_CONFIG)
+
+    try:
+        data = json.loads(
+            CONFIG_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if not isinstance(data, dict):
+            return dict(DEFAULT_CONFIG)
+
+        return deep_merge(
+            DEFAULT_CONFIG,
+            data,
+        )
+
+    except Exception:
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(
+    config: dict[str, Any],
+) -> bool:
+
+    try:
+        CONFIG_FILE.write_text(
+            json.dumps(
+                config,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+
+CONFIG = load_config()
+
+
+# ============================================================
+# TEXT HELPERS
+# ============================================================
+
+def clean_text(value: Any) -> str:
+
+    if value is None:
+        return ""
+
+    text = str(value)
+
+    text = text.replace(
+        "\x00",
+        " ",
+    )
+
+    text = text.replace(
+        "\r\n",
+        "\n",
+    )
+
+    text = text.replace(
+        "\r",
+        "\n",
+    )
+
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+
+def normalize_text(text: str) -> str:
+
+    text = clean_text(text)
+
+    if not text:
+        return ""
+
+    replacements = {
+        "mấy h": "mấy giờ",
+        "may h": "mấy giờ",
+        "mấy g": "mấy giờ",
+        "may g": "mấy giờ",
+        "hnay": "hôm nay",
+        "hom nay": "hôm nay",
+        "iphonee": "iphone",
+    }
+
+    lowered = text.lower()
+
+    for old, new in replacements.items():
+
+        lowered = re.sub(
+            rf"(?<!\w){re.escape(old)}(?!\w)",
+            new,
+            lowered,
+        )
+
+    return lowered.strip()
+
+
+# ============================================================
+# MEMORY
+# ============================================================
+
+def load_memory() -> dict[str, Any]:
+
+    default = {
+        "items": [],
+        "updated_at": None,
+    }
+
+    if not MEMORY_FILE.exists():
+        return default
+
+    try:
+        data = json.loads(
+            MEMORY_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if not isinstance(data, dict):
+            return default
+
+        if not isinstance(
+            data.get("items"),
+            list,
+        ):
+            data["items"] = []
+
+        return data
+
+    except Exception:
+        return default
+
+
+def save_memory(
+    memory: dict[str, Any],
+) -> bool:
+
+    try:
+
+        memory["updated_at"] = (
+            datetime.now().isoformat(
+                timespec="seconds"
+            )
+        )
+
+        MEMORY_FILE.write_text(
+            json.dumps(
+                memory,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+
+MEMORY = load_memory()
+
+
+def memory_add(
+    text: str,
+) -> str:
+
+    text = clean_text(text)
+
+    if not text:
+        return "Minh chưa có nội dung để nhớ."
+
+    items = MEMORY.setdefault(
+        "items",
+        [],
+    )
+
+    item = {
+        "text": text,
+        "created_at": datetime.now().isoformat(
+            timespec="seconds"
+        ),
+    }
+
+    items.append(item)
+
+    max_items = int(
+        CONFIG.get(
+            "memory",
+            {},
+        ).get(
+            "max_items",
+            500,
+        )
+    )
+
+    if len(items) > max_items:
+        del items[
+            : len(items) - max_items
+        ]
+
+    save_memory(MEMORY)
+
+    return f"Minh nhớ rồi: {text}"
+
+
+def memory_list() -> str:
+
+    items = MEMORY.get(
+        "items",
+        [],
+    )
+
+    if not items:
+        return "Hiện Minh chưa lưu điều gì."
+
+    lines = [
+        "Những điều Minh đang nhớ:"
+    ]
+
+    for index, item in enumerate(
+        items[-20:],
+        start=1,
+    ):
+
+        if isinstance(item, dict):
+            value = item.get(
+                "text",
+                "",
+            )
+        else:
+            value = str(item)
+
+        lines.append(
+            f"{index}. {value}"
+        )
+
+    return "\n".join(lines)
+
+
+def memory_search(
+    query: str,
+) -> str:
+
+    query = clean_text(query).lower()
+
+    if not query:
+        return memory_list()
+
+    matches = []
+
+    for item in MEMORY.get(
+        "items",
+        [],
+    ):
+
+        value = (
+            item.get("text", "")
+            if isinstance(item, dict)
+            else str(item)
+        )
+
+        if query in value.lower():
+            matches.append(value)
+
+    if not matches:
+        return (
+            f"Minh chưa tìm thấy ký ức nào "
+            f"liên quan đến '{query}'."
+        )
+
+    return "\n".join(
+        f"{i}. {value}"
+        for i, value in enumerate(
+            matches,
+            start=1,
+        )
+    )
+
+
+# ============================================================
+# TIME / DATE
+# ============================================================
+
+def current_time() -> str:
+
+    now = datetime.now()
+
+    return (
+        f"Bây giờ là "
+        f"{now.strftime('%H:%M:%S')}."
+    )
+
+
+def current_date() -> str:
+
+    now = datetime.now()
+
+    return (
+        f"Hôm nay là "
+        f"{now.strftime('%d/%m/%Y')}."
+    )
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+def load_history() -> list[dict[str, Any]]:
+
+    if not HISTORY_FILE.exists():
+        return []
+
+    try:
+
+        data = json.loads(
+            HISTORY_FILE.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        if not isinstance(data, list):
+            return []
+
+        return data
+
+    except Exception:
+        return []
+
+
+HISTORY = load_history()
+
+
+def save_history() -> bool:
+
+    try:
+
+        max_items = int(
+            CONFIG.get(
+                "history",
+                {},
+            ).get(
+                "max_items",
+                500,
+            )
+        )
+
+        data = HISTORY[-max_items:]
+
+        HISTORY_FILE.write_text(
+            json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+
+def add_history(
+    role: str,
+    content: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+
+    HISTORY.append(
+        {
+            "role": role,
+            "content": clean_text(content),
+            "timestamp": datetime.now().isoformat(
+                timespec="seconds"
+            ),
+            "metadata": metadata or {},
+        }
+    )
+
+    save_history()
+
+
+# ============================================================
+# LOG
+# ============================================================
+
+def log(message: str) -> None:
+
+    try:
+
+        with LOG_FILE.open(
+            "a",
+            encoding="utf-8",
+        ) as file:
+
+            file.write(
+                f"[{datetime.now().isoformat(timespec='seconds')}] "
+                f"{clean_text(message)}\n"
+            )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# OLLAMA
+# ============================================================
+
+def ollama_chat(
+    message: str,
+    context: str = "",
+) -> str:
+
+    message = clean_text(message)
+
+    if not message:
+        return ""
+
+    try:
+
+        import json as _json
+        from urllib.request import (
+            Request,
+            urlopen,
+        )
+
+        ollama_config = CONFIG.get(
+            "ollama",
+            {},
+        )
+
+        host = str(
+            ollama_config.get(
+                "host",
+                "http://127.0.0.1:11434",
+            )
+        ).rstrip("/")
+
+        model = str(
+            ollama_config.get(
+                "model",
+                "qwen3:4b",
+            )
+        )
+
+        timeout = int(
+            ollama_config.get(
+                "timeout",
+                120,
+            )
+        )
+
+        system_prompt = (
+            "Bạn là MINH MINI, trợ lý cá nhân của Lam. "
+            "Trả lời tự nhiên, chính xác, ngắn gọn khi câu hỏi đơn giản. "
+            "Không được tự nhận đã mở, đóng, chạy hoặc thực hiện "
+            "một hành động trên máy tính nếu hệ thống chưa cung cấp "
+            "kết quả thực thi thành công. "
+            "Nếu thiếu thông tin quan trọng, hãy nói rõ điều còn thiếu."
+        )
+
+        if context:
+            system_prompt += (
+                "\n\nNgữ cảnh cuộc trò chuyện hiện tại:\n"
+                + context
+            )
+
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": message,
+                },
+            ],
+            "stream": False,
+            "options": {
+                "temperature": float(
+                    ollama_config.get(
+                        "temperature",
+                        0.3,
+                    )
+                ),
+            },
+        }
+
+        request = Request(
+            host + "/api/chat",
+            data=_json.dumps(
+                payload,
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            headers={
+                "Content-Type":
+                    "application/json",
+            },
+            method="POST",
+        )
+
+        with urlopen(
+            request,
+            timeout=timeout,
+        ) as response:
+
+            raw = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+
+        data = _json.loads(raw)
+
+        answer = data.get(
+            "message",
+            {},
+        ).get(
+            "content",
+            "",
+        )
+
+        return clean_text(answer)
+
+    except Exception as exc:
+
+        log(
+            "OLLAMA ERROR: "
+            + repr(exc)
+        )
+
+        return ""
+
+
+# ============================================================
+# WEB HANDLER
+# ============================================================
+
+def handle_web(
+    query: str,
+    **kwargs: Any,
+) -> str:
+
+    query = clean_text(query)
+
+    if not query:
+        return (
+            "Lam cần cho Minh biết nội dung muốn tìm."
+        )
+
+    if web is None:
+        return (
+            "Module web chưa được tải."
+        )
+
+    try:
+
+        search_function = getattr(
+            web,
+            "safe_search",
+            None,
+        )
+
+        if not callable(search_function):
+            search_function = getattr(
+                web,
+                "search",
+                None,
+            )
+
+        if not callable(search_function):
+            return (
+                "Module web chưa có hàm tìm kiếm."
+            )
+
+        results = search_function(
+            query
+        )
+
+        if not results:
+            return (
+                f"Minh chưa tìm thấy kết quả phù hợp "
+                f"cho '{query}'."
+            )
+
+        if web_ai is not None:
+
+            summarize = getattr(
+                web_ai,
+                "summarize_results",
+                None,
+            )
+
+            if callable(summarize):
+
+                try:
+
+                    summary = summarize(
+                        query,
+                        results,
+                    )
+
+                    if summary:
+                        return clean_text(
+                            getattr(
+                                summary,
+                                "response",
+                                summary,
+                            )
+                        )
+
+                except TypeError:
+
+                    try:
+
+                        summary = summarize(
+                            results
+                        )
+
+                        if summary:
+                            return clean_text(
+                                getattr(
+                                    summary,
+                                    "response",
+                                    summary,
+                                )
+                            )
+
+                    except Exception:
+                        pass
+
+                except Exception:
+                    pass
+
+        formatter = getattr(
+            web,
+            "format_results",
+            None,
+        )
+
+        if callable(formatter):
+            return clean_text(
+                formatter(results)
+            )
+
+        return clean_text(
+            str(results)
+        )
+
+    except Exception as exc:
+
+        log(
+            "WEB ERROR: "
+            + traceback.format_exc()
+        )
+
+        return (
+            f"Minh gặp lỗi khi tìm web: {exc}"
+        )
+
+
+# ============================================================
+# WEB CONTEXT HANDLER
+# ============================================================
+
+def handle_web_context(
+    message: str,
+    decision: Any = None,
+    **kwargs: Any,
+) -> str:
+
+    if web_context is None:
+        return (
+            "Web Context chưa được tải."
+        )
+
+    try:
+
+        source_number = None
+
+        if decision is not None:
+
+            if isinstance(
+                decision,
+                dict,
+            ):
+                source_number = decision.get(
+                    "source_number"
+                )
+            else:
+                source_number = getattr(
+                    decision,
+                    "source_number",
+                    None,
+                )
+
+        if source_number is None:
+
+            match = re.search(
+                r"(?:nguồn|source|kết quả|result|cái)\s*#?\s*(\d+)",
+                clean_text(message).lower(),
+            )
+
+            if match:
+                source_number = int(
+                    match.group(1)
+                )
+
+        if source_number is not None:
+
+            getter = getattr(
+                web_context,
+                "get_source",
+                None,
+            )
+
+            if callable(getter):
+
+                source = getter(
+                    int(source_number)
+                )
+
+                if source:
+
+                    formatter = getattr(
+                        web_context,
+                        "format_source",
+                        None,
+                    )
+
+                    if callable(formatter):
+                        return clean_text(
+                            formatter(source)
+                        )
+
+                    return clean_text(
+                        str(source)
+                    )
+
+        current = getattr(
+            web_context,
+            "current_context",
+            None,
+        )
+
+        if callable(current):
+
+            value = current()
+
+            if value:
+                return clean_text(
+                    str(value)
+                )
+
+        return (
+            "Minh chưa xác định được nguồn "
+            "mà Lam đang nhắc tới."
+        )
+
+    except Exception as exc:
+
+        log(
+            "WEB CONTEXT ERROR: "
+            + repr(exc)
+        )
+
+        return (
+            "Minh chưa lấy được ngữ cảnh nguồn web."
+        )
+
+
+# ============================================================
+# ACTION HANDLER
+# ============================================================
+
+def handle_action(
+    message: str,
+    decision: Any = None,
+    **kwargs: Any,
+) -> str:
+
+    if action is None:
+        return (
+            "Module điều khiển máy chưa được tải."
+        )
+
+    try:
+
+        handler = getattr(
+            action,
+            "handle_action_command",
+            None,
+        )
+
+        if not callable(handler):
+            handler = getattr(
+                action,
+                "execute_action",
+                None,
+            )
+
+        if not callable(handler):
+            handler = getattr(
+                action,
+                "execute",
+                None,
+            )
+
+        if not callable(handler):
+            return (
+                "Module action chưa có hàm thực thi."
+            )
+
+        action_name = ""
+        target = ""
+        query = ""
+
+        if decision is not None:
+
+            action_name = clean_text(
+                get_decision_value(
+                    decision,
+                    "action",
+                    "",
+                )
+            )
+
+            target = clean_text(
+                get_decision_value(
+                    decision,
+                    "target",
+                    "",
+                )
+            )
+
+            query = clean_text(
+                get_decision_value(
+                    decision,
+                    "query",
+                    "",
+                )
+            )
+
+        result = handler(
+            command=message,
+            action=action_name,
+            target=target,
+            query=query,
+        )
+
+        return normalize_execution_response(
+            result
+        )
+
+    except TypeError:
+
+        try:
+
+            result = handler(message)
+
+            return normalize_execution_response(
+                result
+            )
+
+        except Exception as exc:
+
+            log(
+                "ACTION ERROR: "
+                + traceback.format_exc()
+            )
+
+            return (
+                f"Minh không thực hiện được hành động: {exc}"
+            )
+
+    except Exception as exc:
+
+        log(
+            "ACTION ERROR: "
+            + traceback.format_exc()
+        )
+
+        return (
+            f"Minh không thực hiện được hành động: {exc}"
+        )
+
+
+# ============================================================
+# DECISION HELPERS
+# ============================================================
+
+def get_decision_value(
+    decision: Any,
+    name: str,
+    default: Any = None,
+) -> Any:
+
+    if decision is None:
+        return default
+
+    if isinstance(
+        decision,
+        dict,
+    ):
+        return decision.get(
+            name,
+            default,
+        )
+
+    return getattr(
+        decision,
+        name,
+        default,
+    )
+
+
+def normalize_execution_response(
+    value: Any,
+) -> str:
+
+    if value is None:
+        return ""
+
+    if isinstance(
+        value,
+        str,
+    ):
+        return clean_text(value)
+
+    response = get_decision_value(
+        value,
+        "response",
+        "",
+    )
+
+    if response:
+        return clean_text(
+            response
+        )
+
+    success = get_decision_value(
+        value,
+        "success",
+        None,
+    )
+
+    error = get_decision_value(
+        value,
+        "error",
+        "",
+    )
+
+    if success is False and error:
+        return clean_text(
+            error
+        )
+
+    return clean_text(
+        str(value)
+    )
+
+
+# ============================================================
+# MEMORY HANDLER
+# ============================================================
+
+def handle_memory(
+    message: str,
+    decision: Any = None,
+    **kwargs: Any,
+) -> str:
+
+    text = clean_text(message)
+    lower = text.lower()
+
+    # --------------------------------------------------------
+    # Remember
+    # --------------------------------------------------------
+
+    remember_patterns = (
+        "nhớ ",
+        "ghi nhớ ",
+        "lưu lại ",
+        "hãy nhớ ",
+        "nhớ rằng ",
+    )
+
+    for pattern in remember_patterns:
+
+        if lower.startswith(pattern):
+
+            content = text[
+                len(pattern):
+            ].strip()
+
+            return memory_add(
+                content
+            )
+
+    # --------------------------------------------------------
+    # List
+    # --------------------------------------------------------
+
+    if any(
+        phrase in lower
+        for phrase in (
+            "nhớ gì",
+            "đang nhớ gì",
+            "liệt kê bộ nhớ",
+            "xem bộ nhớ",
+            "memory",
+        )
+    ):
+        return memory_list()
+
+    # --------------------------------------------------------
+    # Search
+    # --------------------------------------------------------
+
+    for prefix in (
+        "tìm trong bộ nhớ ",
+        "tìm bộ nhớ ",
+        "nhớ về ",
+    ):
+
+        if lower.startswith(prefix):
+
+            query = text[
+                len(prefix):
+            ].strip()
+
+            return memory_search(
+                query
+            )
+
+    return memory_list()
+
+
+# ============================================================
+# CHAT CONTEXT
+# ============================================================
+
+def build_chat_context(
+    limit: int = 10,
+) -> str:
+
+    messages = HISTORY[-limit:]
+
+    lines = []
+
+    for item in messages:
+
+        role = clean_text(
+            item.get(
+                "role",
+                "",
+            )
+        )
+
+        content = clean_text(
+            item.get(
+                "content",
+                "",
+            )
+        )
+
+        if not content:
+            continue
+
+        if role == "user":
+            label = "Lam"
+
+        elif role == "assistant":
+            label = "Minh"
+
+        else:
+            label = role or "System"
+
+        lines.append(
+            f"{label}: {content}"
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# BRAIN
+# ============================================================
+
+def create_brain():
+
+    if brain_module is None:
+        return None
+
+    BrainCore = getattr(
+        brain_module,
+        "BrainCore",
+        None,
+    )
+
+    if BrainCore is None:
+        return None
+
+    try:
+        return BrainCore()
+    except Exception as exc:
+        log(
+            "BRAIN INIT ERROR: "
+            + repr(exc)
+        )
+
+        return None
+
+
+# ============================================================
+# CONTROLLER
+# ============================================================
+
+def create_controller(
+    handlers: dict[str, Any],
+):
+
+    if execution_controller is None:
+        return None
+
+    Controller = getattr(
+        execution_controller,
+        "ExecutionController",
+        None,
+    )
+
+    if Controller is None:
+        return None
+
+    try:
+        return Controller(
+            handlers=handlers
+        )
+
+    except TypeError:
+
+        try:
+            controller = Controller()
+
+            register_many = getattr(
+                controller,
+                "register_many",
+                None,
+            )
+
+            if callable(register_many):
+                register_many(
+                    handlers
+                )
+
+            return controller
+
+        except Exception as exc:
+
+            log(
+                "CONTROLLER INIT ERROR: "
+                + repr(exc)
+            )
+
+            return None
+
+    except Exception as exc:
+
+        log(
+            "CONTROLLER INIT ERROR: "
+            + repr(exc)
+        )
+
+        return None
+
+
+# ============================================================
+# BRAIN THINK
+# ============================================================
+
+def brain_think(
+    brain: Any,
+    message: str,
+) -> Any:
+
+    if brain is None:
+
+        if brain_module is None:
+            return None
+
+        functions = (
+            "think",
+            "resolve",
+            "plan",
+        )
+
+        for name in functions:
+
+            function = getattr(
+                brain_module,
+                name,
+                None,
+            )
+
+            if callable(function):
+
+                try:
+                    return function(
+                        message
+                    )
+
+                except TypeError:
+                    try:
+                        return function(
+                            message=message
+                        )
+
+                    except Exception:
+                        pass
+
+                except Exception:
+                    pass
+
+        return None
+
+    for name in (
+        "think",
+        "resolve",
+        "plan",
+    ):
+
+        function = getattr(
+            brain,
+            name,
+            None,
+        )
+
+        if not callable(function):
+            continue
+
+        try:
+
+            decision = function(
+                message
+            )
+
+            if decision is not None:
+                return decision
+
+        except TypeError:
+
+            try:
+
+                decision = function(
+                    message=message
+                )
+
+                if decision is not None:
+                    return decision
+
+            except Exception:
+                pass
+
+        except Exception as exc:
+
+            log(
+                f"BRAIN {name} ERROR: "
+                + repr(exc)
+            )
+
+    return None
+
+
+# ============================================================
+# DECISION FALLBACK
+# ============================================================
+
+def fallback_decision(
+    message: str,
+) -> dict[str, Any]:
+
+    text = clean_text(message)
+    lower = text.lower()
+
+    if lower in {
+        "mấy giờ",
+        "mấy giờ rồi",
+        "bây giờ là mấy giờ",
+        "giờ hiện tại",
+    }:
+        return {
+            "intent": "time",
+            "tool": "time",
+        }
+
+    if any(
+        phrase in lower
+        for phrase in (
+            "hôm nay là ngày bao nhiêu",
+            "hôm nay ngày mấy",
+            "ngày hôm nay",
+        )
+    ):
+        return {
+            "intent": "date",
+            "tool": "date",
+        }
+
+    if lower.startswith(
+        (
+            "nhớ ",
+            "ghi nhớ ",
+            "lưu lại ",
+            "xem bộ nhớ",
+            "nhớ gì",
+        )
+    ):
+        return {
+            "intent": "memory",
+            "tool": "memory",
+        }
+
+    if lower.startswith(
+        (
+            "tìm trên web ",
+            "tìm trên mạng ",
+            "tra cứu ",
+            "search web ",
+        )
+    ):
+
+        query = text
+
+        for prefix in (
+            "tìm trên web ",
+            "tìm trên mạng ",
+            "tra cứu ",
+            "search web ",
+        ):
+
+            if lower.startswith(prefix):
+                query = text[
+                    len(prefix):
+                ]
+                break
+
+        return {
+            "intent": "web",
+            "tool": "web",
+            "query": query,
+        }
+
+    if lower.startswith("mở "):
+
+        return {
+            "intent": "action",
+            "tool": "action",
+            "action": "open",
+            "target": text[3:].strip(),
+        }
+
+    if lower.startswith("đóng "):
+
+        return {
+            "intent": "action",
+            "tool": "action",
+            "action": "close",
+            "target": text[5:].strip(),
+        }
+
+    if "?" in text:
+
+        return {
+            "intent": "question",
+            "tool": "ollama",
+        }
+
+    return {
+        "intent": "chat",
+        "tool": "ollama",
+    }
+
+
+# ============================================================
+# ROUTER
+# ============================================================
+
+def route_decision(
+    message: str,
+    decision: Any,
+) -> Any:
+
+    if router_guard is None:
+        return decision
+
+    guard = getattr(
+        router_guard,
+        "guard_route",
+        None,
+    )
+
+    if not callable(guard):
+        guard = getattr(
+            router_guard,
+            "validate_route",
+            None,
+        )
+
+    if not callable(guard):
+        return decision
+
+    try:
+
+        return guard(
+            message,
+            decision,
+        )
+
+    except TypeError:
+
+        try:
+            return guard(
+                message=message,
+                decision=decision,
+            )
+
+        except Exception:
+            return decision
+
+    except Exception as exc:
+
+        log(
+            "ROUTER ERROR: "
+            + repr(exc)
+        )
+
+        return decision
+
+
+# ============================================================
+# CONTEXT UPDATE
+# ============================================================
+
+def update_context(
+    message: str,
+    answer: str,
+    decision: Any,
+    execution_result: Any = None,
+) -> None:
+
+    if conversation_state is None:
+        return
+
+    updater = getattr(
+        conversation_state,
+        "update_state",
+        None,
+    )
+
+    if not callable(updater):
+        return
+
+    try:
+
+        updater(
+            message=message,
+            answer=answer,
+            decision=decision,
+            result=execution_result,
+        )
+
+        return
+
+    except TypeError:
+        pass
+
+    except Exception as exc:
+
+        log(
+            "CONTEXT UPDATE ERROR: "
+            + repr(exc)
+        )
+
+        return
+
+    # Compatibility fallback
+    try:
+
+        updater(
+            message,
+            answer,
+            decision,
+        )
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# RESPONSE GUARD
+# ============================================================
+
+def guard_answer(
+    message: str,
+    answer: str,
+    execution_result: Any = None,
+    decision: Any = None,
+) -> str:
+
+    answer = clean_text(answer)
+
+    if response_guard is None:
+        return answer
+
+    guard = getattr(
+        response_guard,
+        "guard_response",
+        None,
+    )
+
+    if not callable(guard):
+        guard = getattr(
+            response_guard,
+            "safe_response",
+            None,
+        )
+
+    if not callable(guard):
+        return answer
+
+    try:
+
+        return clean_text(
+            guard(
+                message,
+                answer,
+                execution_result=execution_result,
+                decision=decision,
+            )
+        )
+
+    except TypeError:
+
+        try:
+
+            return clean_text(
+                guard(
+                    message,
+                    answer,
+                )
+            )
+
+        except Exception:
+            return answer
+
+    except Exception as exc:
+
+        log(
+            "RESPONSE GUARD ERROR: "
+            + repr(exc)
+        )
+
+        return answer
+
+
+# ============================================================
+# HANDLER MAP
+# ============================================================
+
+def build_handlers() -> dict[str, Any]:
+
+    return {
+        "action": handle_action,
+        "web": handle_web,
+        "web_ai": handle_web,
+        "web_context": handle_web_context,
+        "memory": handle_memory,
+        "time": lambda **kwargs: current_time(),
+        "date": lambda **kwargs: current_date(),
+        "chat": chat_module.handle_chat,
+        "ollama": chat_module.handle_chat,
+    }
+
+def process(
+    message: str,
+) -> str:
+
+    return MINH.process(
+        message
+    )
+
+
+def ask(
+    message: str,
+) -> str:
+
+    return process(
+        message
+    )
+
+
+def chat(
+    message: str,
+) -> str:
+
+    return process(
+        message
+    )
+
+
+def status() -> dict[str, Any]:
+
+    return MINH.status()
+
+
+# ============================================================
+# SELF CHECK
+# ============================================================
+
+def self_check() -> dict[str, Any]:
+
+    modules = {
+        "brain": brain_module,
+        "conversation_state": conversation_state,
+        "command_completion": command_completion,
+        "router_guard": router_guard,
+        "response_guard": response_guard,
+        "execution_controller": execution_controller,
+        "action": action,
+        "web": web,
+        "web_ai": web_ai,
+        "web_context": web_context,
+    }
+
+    result = {}
+
+    for name, module in modules.items():
+        result[name] = module is not None
+
+    result["config"] = CONFIG_FILE.exists()
+    result["memory"] = MEMORY_FILE.exists() or True
+    result["base_dir"] = BASE_DIR.exists()
+    result["handlers"] = len(
+        MINH.handlers
+    ) > 0
+    result["controller"] = (
+        MINH.controller is not None
+    )
+
+    result["all_core_modules"] = all(
+        result[name]
+        for name in (
+            "brain",
+            "conversation_state",
+            "command_completion",
+            "router_guard",
+            "response_guard",
+            "execution_controller",
+            "action",
+            "web",
+            "web_ai",
+            "web_context",
+        )
+    )
+
+    return result
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+def print_status() -> None:
+
+    print()
+    print(
+        "============================================================"
+    )
+    print(
+        "                 MINH MINI — FINAL"
+    )
+    print(
+        "                 CENTRAL ORCHESTRATOR"
+    )
+    print(
+        "============================================================"
+    )
+
+    state = status()
+
+    for key, value in state.items():
+
+        print(
+            f"{key:22} : {value}"
+        )
+
+    print(
+        "============================================================"
+    )
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+class MinhMiniCore:
+
+    def __init__(self):
+        # GOAL_MANAGER_V6_INIT
+        try:
+            from goal_manager import create_goal_manager
+            self.goal_manager = create_goal_manager()
+        except Exception as exc:
+            self.goal_manager = None
+            log("GOAL MANAGER INIT ERROR: " + repr(exc))
+
+
+        self.brain = create_brain()
+
+        self.handlers = build_handlers()
+
+        self.controller = create_controller(
+            self.handlers
+        )
+
+        self.turn_count = len(
+            HISTORY
+        )
+        # THINK_X_P32_INIT
+        try:
+            from think_x import create_think_x
+            self.think_x = create_think_x()
+        except Exception as exc:
+            self.think_x = None
+            log("THINK X INIT ERROR: " + repr(exc))
+        # THINK_X_P32_LAST_RESULT_INIT
+        self.last_think_x = None
+
+        # META_ORCHESTRATOR_P42_INIT
+        try:
+            from meta_orchestrator import create_meta_orchestrator
+            self.meta_orchestrator = create_meta_orchestrator()
+        except Exception as exc:
+            self.meta_orchestrator = None
+            log("META ORCHESTRATOR INIT ERROR: " + repr(exc))
+        
+        # META_ORCHESTRATOR_P42_LAST_RESULT_INIT
+        self.last_meta_orchestration = None
+
+        # EXECUTION_CONTRACT_P44_INIT
+        try:
+            from execution_contract import create_execution_contract_builder
+            self.execution_contract_builder = create_execution_contract_builder()
+        except Exception as exc:
+            self.execution_contract_builder = None
+            log("EXECUTION CONTRACT INIT ERROR: " + repr(exc))
+
+        # EXECUTION_CONTRACT_P44_LAST_RESULT_INIT
+        self.last_execution_contract = None
+
+        # P45_EXECUTION_VERIFY_INIT
+        self.last_execution_verification = None
+        self.last_execution_contract = None
+
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
+
+    def status(self) -> dict[str, Any]:
+
+        return {
+            "name": "MINH MINI",
+            "mode": "FINAL",
+            "app_dir": str(APP_DIR),
+            "base_dir": str(BASE_DIR),
+            "brain": self.brain is not None,
+            "controller": self.controller is not None,
+            "router_guard": (
+                router_guard is not None
+            ),
+            "response_guard": (
+                response_guard is not None
+            ),
+            "context_manager": (
+                conversation_state is not None
+            ),
+            "command_completion": (
+                command_completion is not None
+            ),
+            "action": action is not None,
+            "web": web is not None,
+            "web_ai": web_ai is not None,
+            "web_context": (
+                web_context is not None
+            ),
+            "memory_items": len(
+                MEMORY.get(
+                    "items",
+                    [],
+                )
+            ),
+            "history_items": len(HISTORY),
+        }
+
+    # --------------------------------------------------------
+    # NORMALIZE
+    # --------------------------------------------------------
+
+    def complete_input(
+        self,
+        message: str,
+    ) -> str:
+
+        message = clean_text(
+            message
+        )
+
+        if not message:
+            return ""
+
+        if command_completion is None:
+            return normalize_text(
+                message
+            )
+
+        function = getattr(
+            command_completion,
+            "normalize_command",
+            None,
+        )
+
+        if not callable(function):
+            function = getattr(
+                command_completion,
+                "complete",
+                None,
+            )
+
+        if not callable(function):
+            return normalize_text(
+                message
+            )
+
+        try:
+
+            result = function(
+                message
+            )
+
+            if isinstance(
+                result,
+                str,
+            ):
+                return clean_text(
+                    result
+                )
+
+            completed = get_decision_value(
+                result,
+                "completed",
+                "",
+            )
+
+            if completed:
+                return clean_text(
+                    completed
+                )
+
+        except Exception as exc:
+
+            log(
+                "COMMAND COMPLETION ERROR: "
+                + repr(exc)
+            )
+
+        return normalize_text(
+            message
+        )
+
+    # --------------------------------------------------------
+    # EXECUTION
+    # --------------------------------------------------------
+
+
+    # --------------------------------------------------------
+    # P4-5 EXECUTION RESULT VERIFIER
+    # --------------------------------------------------------
+
+    def verify_execution_result(
+        self,
+        message: str,
+        decision: Any,
+        execution_result: Any,
+        answer: str,
+    ) -> dict:
+        """
+        P4-5 deterministic execution verification.
+
+        Không thực thi lại action.
+        Không gọi Ollama.
+        Chỉ kiểm tra execution result đã có cấu trúc
+        thành công/thất bại hợp lệ hay chưa.
+        """
+
+        intent = clean_text(
+            get_decision_value(
+                decision,
+                "intent",
+                "",
+            )
+        )
+
+        success = get_decision_value(
+            execution_result,
+            "success",
+            None,
+        )
+
+        error = get_decision_value(
+            execution_result,
+            "error",
+            "",
+        )
+
+        tool = clean_text(
+            get_decision_value(
+                execution_result,
+                "tool",
+                "",
+            )
+        )
+
+        checks = []
+
+        # ----------------------------------------------------
+        # Basic result existence
+        # ----------------------------------------------------
+
+        if execution_result is None:
+            checks.append("missing_execution_result")
+
+        # ----------------------------------------------------
+        # Success must be explicit
+        # ----------------------------------------------------
+
+        if success is True:
+            checks.append("success_true")
+        elif success is False:
+            checks.append("success_false")
+        else:
+            checks.append("success_unknown")
+
+        # ----------------------------------------------------
+        # Answer check
+        # ----------------------------------------------------
+
+        answer_ok = bool(
+            isinstance(answer, str)
+            and answer.strip()
+        )
+
+        if answer_ok:
+            checks.append("answer_present")
+        else:
+            checks.append("answer_missing")
+
+        # ----------------------------------------------------
+        # Error consistency
+        # ----------------------------------------------------
+
+        if success is False and error:
+            checks.append("error_present")
+        elif success is False and not error:
+            checks.append("error_missing")
+
+        # ----------------------------------------------------
+        # Tool consistency
+        # ----------------------------------------------------
+
+        if intent in {
+            "action",
+            "web",
+            "memory",
+            "time",
+            "date",
+        }:
+            if tool:
+                checks.append("tool_present")
+            else:
+                checks.append("tool_missing")
+
+        # ----------------------------------------------------
+        # PASS / FAIL
+        # ----------------------------------------------------
+
+        if execution_result is None:
+            verified = False
+            status = "fail"
+
+        elif success is False:
+            verified = False
+            status = "fail"
+
+        elif success is not True:
+            verified = False
+            status = "fail"
+
+        elif not answer_ok:
+            verified = False
+            status = "fail"
+
+        elif (
+            intent in {
+                "action",
+                "web",
+                "memory",
+                "time",
+                "date",
+            }
+            and not tool
+        ):
+            verified = False
+            status = "fail"
+
+        else:
+            verified = True
+            status = "pass"
+
+        return {
+            "verified": verified,
+            "status": status,
+            "success": success,
+            "tool": tool,
+            "intent": intent,
+            "answer_present": answer_ok,
+            "error": error,
+            "checks": checks,
+            "message": message,
+        }
+
+    def execute_decision(
+        self,
+        message: str,
+        decision: Any,
+    ) -> tuple[str, Any]:
+
+        intent = clean_text(
+            get_decision_value(
+                decision,
+                "intent",
+                "",
+            )
+        )
+
+        tool = clean_text(
+            get_decision_value(
+                decision,
+                "tool",
+                "",
+            )
+        )
+
+        # ----------------------------------------------------
+        # Direct time/date
+        # ----------------------------------------------------
+
+        if intent == "time":
+            return current_time(), {
+                "success": True,
+                "tool": "time",
+                "intent": "time",
+            }
+
+        if intent == "date":
+            return current_date(), {
+                "success": True,
+                "tool": "date",
+                "intent": "date",
+            }
+
+        # ----------------------------------------------------
+        # Controller
+        # ----------------------------------------------------
+
+        if self.controller is not None:
+
+            try:
+
+                execute = getattr(
+                    self.controller,
+                    "execute",
+                    None,
+                )
+
+                if callable(execute):
+
+                    result = execute(
+                        message,
+                        decision,
+                    )
+
+                    answer = normalize_execution_response(
+                        result
+                    )
+
+                    if answer:
+                        return answer, result
+
+            except TypeError:
+
+                try:
+
+                    result = execute(
+                        message=message,
+                        decision=decision,
+                    )
+
+                    answer = normalize_execution_response(
+                        result
+                    )
+
+                    if answer:
+                        return answer, result
+
+                except Exception as exc:
+
+                    log(
+                        "CONTROLLER EXECUTE ERROR: "
+                        + traceback.format_exc()
+                    )
+
+            except Exception as exc:
+
+                log(
+                    "CONTROLLER EXECUTE ERROR: "
+                    + traceback.format_exc()
+                )
+
+        # ----------------------------------------------------
+        # Direct handler fallback
+        # ----------------------------------------------------
+
+        handler = self.handlers.get(
+            tool
+        )
+
+        if callable(handler):
+
+            try:
+
+                result = handler(
+                    message=message,
+                    decision=decision,
+                )
+
+                answer = normalize_execution_response(
+                    result
+                )
+
+                if answer:
+                    return answer, result
+
+            except TypeError:
+
+                try:
+
+                    result = handler(
+                        message
+                    )
+
+                    answer = normalize_execution_response(
+                        result
+                    )
+
+                    if answer:
+                        return answer, result
+
+                except Exception as exc:
+
+                    log(
+                        "HANDLER FALLBACK ERROR: "
+                        + traceback.format_exc()
+                    )
+
+            except Exception:
+
+                log(
+                    "HANDLER FALLBACK ERROR: "
+                    + traceback.format_exc()
+                )
+
+        # ----------------------------------------------------
+        # Final Ollama fallback
+        # ----------------------------------------------------
+
+        answer = ollama_chat(
+            message,
+            build_chat_context(),
+        )
+
+        return answer, {
+            "success": bool(answer),
+            "tool": "ollama",
+            "intent": intent or "chat",
+        }
+
+    # --------------------------------------------------------
+    # PROCESS
+    # --------------------------------------------------------
+
+    def process(
+        self,
+        message: str,
+    ) -> str:
+
+        original = clean_text(
+            message
+        )
+
+        if not original:
+            return (
+                "Lam chưa nhập nội dung gì."
+            )
+
+        self.turn_count += 1
+
+        # P45_VERIFY_STATE_LIFECYCLE_V2
+        self.last_execution_verification = None
+
+        log(
+            f"USER: {original}"
+        )
+
+        add_history(
+            "user",
+            original,
+        )
+
+        # ----------------------------------------------------
+        # 1. COMMAND COMPLETION
+        # ----------------------------------------------------
+
+        completed = self.complete_input(
+            original
+        )
+
+        if not completed:
+            completed = original
+
+        # ----------------------------------------------------
+        # 2. BRAIN
+        # ----------------------------------------------------
+
+        decision = brain_think(
+            self.brain,
+            completed,
+        )
+
+        if decision is None:
+            decision = fallback_decision(
+                completed
+            )
+
+        # P44_REASONING_CONTEXT_FINAL
+        # Giữ nguyên quyết định gốc của Brain cho THINK X,
+        # Meta-Orchestrator và Execution Contract.
+        reasoning_decision = decision
+
+        # ----------------------------------------------------
+        # 3. ROUTER GUARD
+        # ----------------------------------------------------
+
+        route = route_decision(
+            completed,
+            decision,
+        )
+
+        # Nếu Router trả về RouteCheck,
+        # dùng nó làm decision mới.
+        if route is not None:
+
+            route_intent = get_decision_value(
+                route,
+                "intent",
+                None,
+            )
+
+            if route_intent:
+                decision = route
+
+        # ----------------------------------------------------
+        # 4. CLARIFICATION
+        # ----------------------------------------------------
+
+        # GOAL_MANAGER_V6_UPDATE
+        if self.goal_manager is not None:
+            try:
+                updater = getattr(
+                    self.goal_manager,
+                    "update_from_decision",
+                    None,
+                )
+                if callable(updater):
+                    updater(completed, decision)
+            except Exception as exc:
+                log("GOAL MANAGER UPDATE ERROR: " + repr(exc))
+
+
+        # THINK_X_P32_ANALYZE
+        think_result = None
+        if self.think_x is not None:
+            try:
+                current_goal = None
+                if hasattr(self, 'goal_manager'):
+                    getter = getattr(
+                        self.goal_manager,
+                        'get_current',
+                    )
+                    if callable(getter):
+                        current_goal = getter()
+                think_result = self.think_x.think(
+                    completed,
+                    reasoning_decision,
+                    current_goal,
+                )
+                self.last_think_x = think_result
+            except Exception as exc:
+                self.last_think_x = None
+                log(
+                    "THINK X ANALYZE ERROR: " + repr(exc)
+                )
+        # META_ORCHESTRATOR_P42_ANALYZE
+        meta_result = None
+        if self.meta_orchestrator is not None:
+            try:
+                current_goal = None
+                if hasattr(self, 'goal_manager'):
+                    getter = getattr(
+                        self.goal_manager,
+                        'get_current',
+                    )
+                    if callable(getter):
+                        current_goal = getter()
+        
+                meta_result = self.meta_orchestrator.orchestrate(
+                    completed,
+                    reasoning_decision,
+                    think_result,
+                    current_goal,
+                )
+                self.last_meta_orchestration = meta_result
+            except Exception as exc:
+                self.last_meta_orchestration = None
+                log(
+                    "META ORCHESTRATOR ANALYZE ERROR: "
+                    + repr(exc)
+                )
+
+        # EXECUTION_CONTRACT_P44_BUILD
+        execution_contract = None
+        if self.execution_contract_builder is not None:
+            try:
+                contract_meta = meta_result
+
+                execution_contract = self.execution_contract_builder.build(
+                    completed,
+                    contract_meta,
+                )
+                self.last_execution_contract = execution_contract
+            except Exception as exc:
+                self.last_execution_contract = None
+                execution_contract = None
+                log(
+                    "EXECUTION CONTRACT BUILD ERROR: "
+                    + repr(exc)
+                )
+
+        needs_clarification = bool(
+            get_decision_value(
+                decision,
+                "needs_clarification",
+                False,
+            )
+        )
+
+        # EXECUTION_CONTRACT_P44_GATE
+        contract_blocks_execution = False
+        if execution_contract is not None:
+            contract_intent = get_decision_value(
+                reasoning_decision,
+                'intent',
+                '',
+            )
+            if (
+                contract_intent in {
+                    'action',
+                    'web',
+                    'memory',
+                    'time',
+                    'date',
+                }
+                and not execution_contract.allowed
+            ):
+                contract_blocks_execution = True
+        
+        if contract_blocks_execution:
+            needs_clarification = True
+
+        if needs_clarification:
+
+            # P45_VERIFY_STATE_LIFECYCLE_V2
+            self.last_execution_verification = {
+                "verified": False,
+                "status": "blocked",
+                "success": None,
+                "tool": get_decision_value(
+                    decision,
+                    "tool",
+                    "",
+                ),
+                "intent": get_decision_value(
+                    decision,
+                    "intent",
+                    "",
+                ),
+                "answer_present": False,
+                "error": "",
+                "checks": [
+                    "execution_not_started",
+                    "clarification_required",
+                ],
+                "message": completed,
+            }
+
+            answer = self.make_clarification(
+                completed,
+                decision,
+            )
+
+            answer = guard_answer(
+                original,
+                answer,
+                decision=decision,
+            )
+
+            add_history(
+                "assistant",
+                answer,
+                {
+                    "intent": get_decision_value(
+                        decision,
+                        "intent",
+                        "",
+                    ),
+                },
+            )
+
+            update_context(
+                original,
+                answer,
+                decision,
+            )
+
+            log(
+                f"ASSISTANT: {answer}"
+            )
+
+            return answer
+
+        # ----------------------------------------------------
+        # 5. EXECUTION
+        # ----------------------------------------------------
+
+        answer, execution_result = (
+            self.execute_decision(
+                completed,
+                decision,
+            )
+        )
+
+        # P45_EXECUTION_VERIFY
+        verification = None
+        try:
+            verifier = getattr(
+                self,
+                "verify_execution_result",
+                None,
+            )
+
+            if callable(verifier):
+                verification = verifier(
+                    completed,
+                    decision,
+                    execution_result,
+                    answer,
+                )
+
+            self.last_execution_verification = verification
+
+        except Exception as exc:
+            self.last_execution_verification = None
+            verification = {
+                "verified": False,
+                "status": "fail",
+                "success": get_decision_value(
+                    execution_result,
+                    "success",
+                    None,
+                ),
+                "error": repr(exc),
+                "checks": [
+                    "verification_exception",
+                ],
+            }
+
+            log(
+                "EXECUTION VERIFY ERROR: "
+                + traceback.format_exc()
+            )
+
+        # GOAL_MANAGER_V6_RESULT
+        if self.goal_manager is not None:
+            try:
+                success = get_decision_value(
+                    execution_result,
+                    "success",
+                    None,
+                )
+
+                if success is True:
+                    complete = getattr(
+                        self.goal_manager,
+                        "complete",
+                        None,
+                    )
+                    if callable(complete):
+                        complete()
+
+                elif success is False:
+                    error = get_decision_value(
+                        execution_result,
+                        "error",
+                        "execution_failed",
+                    )
+                    fail = getattr(
+                        self.goal_manager,
+                        "fail",
+                        None,
+                    )
+                    if callable(fail):
+                        fail(str(error or 'execution_failed'))
+
+            except Exception as exc:
+                log("GOAL MANAGER RESULT ERROR: " + repr(exc))
+
+
+        # ----------------------------------------------------
+        # 6. RESPONSE GUARD
+        # ----------------------------------------------------
+
+        answer = guard_answer(
+            original,
+            answer,
+            execution_result=execution_result,
+            decision=decision,
+        )
+
+        if not answer:
+            answer = (
+                "Minh chưa tạo được câu trả lời "
+                "cho yêu cầu này."
+            )
+
+        # ----------------------------------------------------
+        # 7. CONTEXT
+        # ----------------------------------------------------
+
+        update_context(
+            original,
+            answer,
+            decision,
+            execution_result,
+        )
+
+        # ----------------------------------------------------
+        # 8. HISTORY
+        # ----------------------------------------------------
+
+        add_history(
+            "assistant",
+            answer,
+            {
+                "intent": get_decision_value(
+                    decision,
+                    "intent",
+                    "",
+                ),
+                "tool": get_decision_value(
+                    decision,
+                    "tool",
+                    "",
+                ),
+                "action": get_decision_value(
+                    decision,
+                    "action",
+                    "",
+                ),
+                "target": get_decision_value(
+                    decision,
+                    "target",
+                    "",
+                ),
+                "verified": (
+                    get_decision_value(
+                        verification,
+                        "verified",
+                        False,
+                    )
+                    if verification is not None
+                    else False
+                ),
+                "verification_status": (
+                    get_decision_value(
+                        verification,
+                        "status",
+                        "fail",
+                    )
+                    if verification is not None
+                    else "fail"
+                ),
+            },
+        )
+
+        log(
+            f"ASSISTANT: {answer}"
+        )
+
+        return answer
+
+    # --------------------------------------------------------
+    # CLARIFICATION
+    # --------------------------------------------------------
+
+    def make_clarification(
+        self,
+        message: str,
+        decision: Any,
+    ) -> str:
+
+        reason = clean_text(
+            get_decision_value(
+                decision,
+                "reason",
+                "",
+            )
+        )
+
+        action_name = clean_text(
+            get_decision_value(
+                decision,
+                "action",
+                "",
+            )
+        )
+
+        target = clean_text(
+            get_decision_value(
+                decision,
+                "target",
+                "",
+            )
+        )
+
+        if (
+            action_name
+            and not target
+        ):
+            return (
+                f"Lam muốn Minh {action_name} "
+                f"cái gì?"
+            )
+
+        if "query" in reason:
+            return (
+                "Lam muốn Minh tìm thông tin gì?"
+            )
+
+        if "reference" in reason:
+            return (
+                "Lam đang nói tới nguồn hoặc "
+                "mục nào vậy?"
+            )
+
+        if "target" in reason:
+            return (
+                "Lam muốn Minh thao tác với "
+                "ứng dụng hoặc thư mục nào?"
+            )
+
+        return (
+            "Minh chưa xác định chắc chắn ý Lam. "
+            "Lam nói rõ thêm một chút nhé."
+        )
+
+
+# ============================================================
+# GLOBAL INSTANCE
+# ============================================================
+
+MINH = MinhMiniCore()
+
+
+# ============================================================
+# PUBLIC API
+# ============================================================
+
+
+def main() -> None:
+
+    print_status()
+
+    print(
+        "MINH MINI > Sẵn sàng."
+    )
+
+    print(
+        "MINH MINI > Gõ 'thoát' để kết thúc."
+    )
+
+    print()
+
+    while True:
+
+        try:
+
+            message = input(
+                "Lam > "
+            )
+
+        except (
+            EOFError,
+            KeyboardInterrupt,
+        ):
+
+            print()
+            print(
+                "MINH MINI > Tạm biệt Lam."
+            )
+
+            break
+
+        message = clean_text(
+            message
+        )
+
+        if not message:
+            continue
+
+        if message.lower() in {
+            "thoát",
+            "thoat",
+            "exit",
+            "quit",
+            "q",
+        }:
+
+            print(
+                "MINH MINI > Tạm biệt Lam."
+            )
+
+            break
+
+        try:
+
+            answer = MINH.process(
+                message
+            )
+
+            print(
+                f"MINH MINI > {answer}"
+            )
+
+        except Exception as exc:
+
+            log(
+                "MAIN LOOP ERROR: "
+                + traceback.format_exc()
+            )
+
+            print(
+                "MINH MINI > Minh gặp lỗi khi "
+                "xử lý yêu cầu này."
+            )
+
+
+# ============================================================
+# DIRECT RUN
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
