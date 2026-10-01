@@ -26,6 +26,10 @@ from __future__ import annotations
 from tool_selector import create_tool_selector
 from observer import create_observer
 from lifecycle import create_execution_lifecycle
+try:
+    from diagnosis_recovery_replan import create_diagnosis_recovery_replan
+except Exception as _p13_import_error:
+    create_diagnosis_recovery_replan = None
 
 from pathlib import Path
 from datetime import datetime
@@ -2119,6 +2123,18 @@ class MinhMiniCore:
             self.execution_lifecycle = None
             log("P12-3 LIFECYCLE INIT ERROR: " + repr(exc))
         self.last_execution_lifecycle = None
+
+        # P13-1 DIAGNOSIS -> RECOVERY -> REPLAN
+        try:
+            self.p13_recovery = (
+                create_diagnosis_recovery_replan()
+                if create_diagnosis_recovery_replan is not None
+                else None
+            )
+        except Exception as exc:
+            self.p13_recovery = None
+            log("P13 INIT ERROR: " + repr(exc))
+        self.last_p13_result = None
 
         # THINK_X_P32_INIT
         try:
@@ -4471,6 +4487,33 @@ class MinhMiniCore:
             )
         except Exception as exc:
             log("P12-3 FINALIZE ERROR: " + repr(exc))
+
+        # P13-1 DIAGNOSIS -> RECOVERY -> REPLAN
+        # Read-only recovery planning. Never executes or retries.
+        try:
+            if self.p13_recovery is not None:
+                self.last_p13_result = self.p13_recovery.analyze(
+                    message=completed,
+                    decision=decision,
+                    execution_result=execution_result,
+                    verification=verification,
+                    lifecycle=getattr(
+                        self,
+                        "last_execution_lifecycle",
+                        None,
+                    ),
+                )
+        except Exception as exc:
+            self.last_p13_result = {
+                "status": "review",
+                "diagnosis": "p13_exception",
+                "recovery": "stop",
+                "replan": ["record_p13_error", "await_new_instruction"],
+                "reason": repr(exc),
+                "checks": ["p13_exception"],
+                "version": "P13-1.0",
+            }
+            log("P13 ANALYZE ERROR: " + traceback.format_exc())
 
         # ----------------------------------------------------
         # P10-4 EVALUATION — ADVISORY ONLY
