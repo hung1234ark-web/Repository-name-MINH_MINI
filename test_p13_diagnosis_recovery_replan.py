@@ -1,3 +1,4 @@
+import diagnosis_recovery_replan
 from diagnosis_recovery_replan import create_diagnosis_recovery_replan
 
 def test_p13_success_passthrough():
@@ -25,4 +26,4 @@ def test_p13_action_failure_replans_without_execution():
     assert "await_reexecution_authorization" in result["replan"]
 
 def test_p13_self_check():
-    assert create_diagnosis_recovery_replan().self_check() if hasattr(create_diagnosis_recovery_replan(), "self_check") else True
+    assert diagnosis_recovery_replan.self_check()["valid"] is True
