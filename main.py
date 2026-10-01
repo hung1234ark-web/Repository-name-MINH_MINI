@@ -31,6 +31,11 @@ try:
 except Exception as _p13_import_error:
     create_diagnosis_recovery_replan = None
 
+try:
+    from recovery_gate import create_recovery_gate
+except Exception as _p13_2_import_error:
+    create_recovery_gate = None
+
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -2135,6 +2140,18 @@ class MinhMiniCore:
             self.p13_recovery = None
             log("P13 INIT ERROR: " + repr(exc))
         self.last_p13_result = None
+
+        # P13-2 RECOVERY GATE
+        try:
+            self.p13_recovery_gate = (
+                create_recovery_gate()
+                if create_recovery_gate is not None
+                else None
+            )
+        except Exception as exc:
+            self.p13_recovery_gate = None
+            log("P13-2 RECOVERY GATE INIT ERROR: " + repr(exc))
+        self.last_p13_recovery_gate = None
 
         # THINK_X_P32_INIT
         try:
@@ -4514,6 +4531,31 @@ class MinhMiniCore:
                 "version": "P13-1.0",
             }
             log("P13 ANALYZE ERROR: " + traceback.format_exc())
+
+        # P13-2 RECOVERY GATE
+        # Converts P13-1 output into an explicit next-step gate.
+        # Never executes, retries, routes, or mutates the task planner.
+        try:
+            gate = getattr(self, "p13_recovery_gate", None)
+            if gate is not None:
+                self.last_p13_recovery_gate = gate.evaluate(
+                    self.last_p13_result
+                )
+            else:
+                self.last_p13_recovery_gate = None
+        except Exception as exc:
+            self.last_p13_recovery_gate = {
+                "decision": "stop",
+                "action_required": "await_new_instruction",
+                "allowed_to_execute": False,
+                "reason": "p13_2_exception",
+                "checks": ["p13_2_exception"],
+                "version": "P13-2.0",
+            }
+            log(
+                "P13-2 RECOVERY GATE ERROR: "
+                + traceback.format_exc()
+            )
 
         # ----------------------------------------------------
         # P10-4 EVALUATION — ADVISORY ONLY
