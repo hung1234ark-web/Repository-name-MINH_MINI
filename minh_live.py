@@ -1,48 +1,79 @@
-import json
+import subprocess
 import time
-import urllib.request
 from datetime import datetime
 
-REPO = "hung1234ark-web/Repository-name-MINH_MINI"
+REMOTE = "origin"
 BRANCH = "main"
 INTERVAL = 3
+SHOW_COMMITS = 8
 
-def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "MINH-MINI-Live-Monitor/1.0"})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read().decode("utf-8"))
+def run_git(*args):
+    result = subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result.stdout.strip()
+
+def remote_head():
+    output = run_git("ls-remote", REMOTE, f"refs/heads/{BRANCH}")
+    if not output:
+        raise RuntimeError("remote branch not found")
+    return output.split()[0]
+
+def update_remote_ref():
+    run_git("fetch", REMOTE, BRANCH, "--quiet")
+    return run_git("rev-parse", f"{REMOTE}/{BRANCH}")
 
 def snapshot():
-    data = fetch_json(f"https://api.github.com/repos/{REPO}/commits?sha={BRANCH}&per_page=8")
-    return [(x["sha"][:7], x["commit"]["message"].splitlines()[0], x["commit"]["author"]["date"]) for x in data]
+    head = update_remote_ref()
+    log = run_git(
+        "log",
+        f"-{SHOW_COMMITS}",
+        "--date=iso",
+        "--pretty=format:%h%x09%ad%x09%s",
+        f"{REMOTE}/{BRANCH}",
+    )
+    items = []
+    for line in log.splitlines():
+        sha, date, msg = line.split("\t", 2)
+        items.append((sha, date, msg))
+    return head, items
 
-def render(items, first=False):
+def render(head, items):
     print("\033[2J\033[H", end="")
     print("╔══════════════════════════════════════════════════════════╗")
     print("║              MINH MINI — LIVE WORK MONITOR             ║")
     print("╚══════════════════════════════════════════════════════════╝")
-    print(f"Repo : {REPO}")
-    print(f"Branch: {BRANCH}")
-    print(f"Poll : every {INTERVAL}s")
-    print(f"Time : {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')}")
+    print(f"Remote : {REMOTE}")
+    print(f"Branch : {BRANCH}")
+    print(f"Poll   : every {INTERVAL}s")
+    print(f"Time   : {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')}")
+    print(f"HEAD   : {head[:12]}")
     print()
     print("THAY ĐỔI THẬT TRÊN GITHUB (commit mới nhất trước):")
-    for sha, msg, date in items:
+    for sha, date, msg in items:
         print(f"  [{sha}] {date}  {msg}")
     print()
-    print("Monitor này chỉ hiển thị thay đổi thật đã xuất hiện trên repo.")
+    print("Monitor dùng Git để theo dõi remote branch, không gọi GitHub REST API.")
+    print("Vì vậy không bị GitHub API rate limit 403 như bản cũ.")
     print("Nó KHÔNG giả lập thao tác gõ code và KHÔNG hiển thị suy nghĩ nội bộ.")
     print()
     print("Ctrl+C để thoát.")
 
 def main():
-    previous = None
+    previous_head = None
     while True:
         try:
-            items = snapshot()
-            if items != previous or previous is None:
-                render(items, first=previous is None)
-                previous = items
+            head, items = snapshot()
+            if head != previous_head:
+                render(head, items)
+                previous_head = head
         except Exception as e:
             print(f"\n[MONITOR ERROR] {e}")
         time.sleep(INTERVAL)
