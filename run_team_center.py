@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import threading
 import time
-import urllib.request
 
 from team_agent_bridge import dispatch_assigned_tasks
 
@@ -16,15 +15,22 @@ from team_agent_bridge import dispatch_assigned_tasks
 def _dispatch_loop(interval: int) -> None:
     while True:
         try:
-            dispatch_assigned_tasks(limit=3)
+            results = dispatch_assigned_tasks(limit=3)
+            for result in results:
+                print(
+                    f"[TEAM DISPATCH] {result.task_id} / "
+                    f"{result.agent_id} / "
+                    f"{'OK' if result.success else 'BLOCKED'} / "
+                    f"{result.message}"
+                )
         except Exception as exc:
-            # Launcher must stay alive; failed dispatch is not success.
+            # Launcher stays alive; failures are never treated as success.
             print(f"[TEAM DISPATCH ERROR] {exc}")
         time.sleep(max(2, interval))
 
 
 def start(host: str = "127.0.0.1", port: int = 8765, interval: int = 5) -> None:
-    from team_center_web import run_server
+    from team_center_web import run
 
     worker = threading.Thread(
         target=_dispatch_loop,
@@ -39,7 +45,7 @@ def start(host: str = "127.0.0.1", port: int = 8765, interval: int = 5) -> None:
     print("Dispatcher: ACTIVE")
     print("Auto-success: DISABLED")
 
-    run_server(host=host, port=port)
+    run(host=host, port=port)
 
 
 def main() -> None:
