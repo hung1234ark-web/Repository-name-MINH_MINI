@@ -1,0 +1,608 @@
+"""
+MINH MINI - P9-1 Critic Core
+Version: P9-1.0
+
+Purpose:
+    Evaluate goal, plan and execution result for structural,
+    logical and consistency issues.
+
+Design constraints:
+    - No execution
+    - No routing
+    - No Ollama
+    - No Web
+    - No Action
+    - No World Model mutation
+    - No State Manager mutation
+    - Deterministic evaluation
+"""
+
+from copy import deepcopy
+from typing import Any, Dict, List, Optional
+
+
+class Critic:
+    VERSION = "P9-1.0"
+
+    VALID_VERDICTS = {
+        "pass",
+        "review",
+        "block",
+    }
+
+    def __init__(self) -> None:
+        self.last_result: Optional[Dict[str, Any]] = None
+
+    # =========================================================
+    # NORMALIZATION
+    # =========================================================
+
+    @staticmethod
+    def _as_dict(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+
+        if value is None:
+            return {}
+
+        data = getattr(value, "__dict__", None)
+        if isinstance(data, dict):
+            return dict(data)
+
+        return {}
+
+    @staticmethod
+    def _clean_text(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    # =========================================================
+    # GOAL CHECK
+    # =========================================================
+
+    def _check_goal(
+        self,
+        goal: Any,
+        issues: List[str],
+        warnings: List[str],
+        checks: Dict[str, bool],
+    ) -> None:
+        goal_data = self._as_dict(goal)
+
+        if not goal_data:
+            issues.append("missing_goal")
+            checks["goal_present"] = False
+            return
+
+        checks["goal_present"] = True
+
+        text = self._clean_text(
+            goal_data.get("text")
+            or goal_data.get("goal")
+            or goal_data.get("description")
+        )
+
+        if not text:
+            issues.append("empty_goal_text")
+            checks["goal_text_present"] = False
+        else:
+            checks["goal_text_present"] = True
+
+        intent = self._clean_text(
+            goal_data.get("intent")
+        )
+
+        if intent:
+            checks["goal_intent_present"] = True
+        else:
+            warnings.append("missing_goal_intent")
+            checks["goal_intent_present"] = False
+
+    # =========================================================
+    # PLAN CHECK
+    # =========================================================
+
+    def _check_plan(
+        self,
+        plan: Any,
+        issues: List[str],
+        warnings: List[str],
+        checks: Dict[str, bool],
+    ) -> None:
+        plan_data = self._as_dict(plan)
+
+        if not plan_data:
+            warnings.append("missing_plan")
+            checks["plan_present"] = False
+            return
+
+        checks["plan_present"] = True
+
+        tasks = plan_data.get("tasks")
+
+        if tasks is None:
+            warnings.append("plan_tasks_missing")
+            checks["tasks_present"] = False
+            return
+
+        if not isinstance(tasks, list):
+            issues.append("tasks_not_list")
+            checks["tasks_present"] = False
+            return
+
+        checks["tasks_present"] = True
+
+        if not tasks:
+            warnings.append("no_tasks")
+            checks["tasks_nonempty"] = False
+            return
+
+        checks["tasks_nonempty"] = True
+
+        task_ids = []
+        active_count = 0
+
+        for index, task in enumerate(tasks):
+            if not isinstance(task, dict):
+                issues.append(
+                    f"invalid_task_{index}"
+                )
+                continue
+
+            task_id = self._clean_text(
+                task.get("id")
+                or task.get("task_id")
+            )
+
+            if task_id:
+                task_ids.append(task_id)
+            else:
+                warnings.append(
+                    f"task_{index}_missing_id"
+                )
+
+            description = self._clean_text(
+                task.get("description")
+                or task.get("text")
+            )
+
+            if not description:
+                warnings.append(
+                    f"task_{index}_missing_description"
+                )
+
+            status = self._clean_text(
+                task.get("status")
+            ).lower()
+
+            if status == "active":
+                active_count += 1
+
+        duplicates = (
+            len(task_ids) != len(set(task_ids))
+        )
+
+        if duplicates:
+            issues.append("duplicate_task_ids")
+            checks["unique_task_ids"] = False
+        else:
+            checks["unique_task_ids"] = True
+
+        if active_count > 1:
+            issues.append("multiple_active_tasks")
+            checks["single_active_task"] = False
+        else:
+            checks["single_active_task"] = True
+
+    # =========================================================
+    # RESULT CHECK
+    # =========================================================
+
+    def _check_result(
+        self,
+        result: Any,
+        issues: List[str],
+        warnings: List[str],
+        checks: Dict[str, bool],
+    ) -> None:
+        if result is None:
+            warnings.append("missing_execution_result")
+            checks["result_present"] = False
+            return
+
+        result_data = self._as_dict(result)
+
+        if not result_data:
+            warnings.append("empty_execution_result")
+            checks["result_present"] = False
+            return
+
+        checks["result_present"] = True
+
+        success = result_data.get("success")
+
+        if success is not None and not isinstance(
+            success,
+            bool,
+        ):
+            issues.append(
+                "invalid_result_success_type"
+            )
+            checks["success_type_valid"] = False
+        else:
+            checks["success_type_valid"] = True
+
+        verification = result_data.get(
+            "verification"
+        )
+
+        if verification is not None:
+            if not isinstance(
+                verification,
+                dict,
+            ):
+                issues.append(
+                    "invalid_verification_structure"
+                )
+                checks[
+                    "verification_structure_valid"
+                ] = False
+            else:
+                checks[
+                    "verification_structure_valid"
+                ] = True
+
+                verified = verification.get(
+                    "verified"
+                )
+
+                verification_success = (
+                    verification.get("success")
+                )
+
+                if (
+                    verified is True
+                    and verification_success is False
+                ):
+                    issues.append(
+                        "verification_success_conflict"
+                    )
+
+    # =========================================================
+    # CONSISTENCY CHECK
+    # =========================================================
+
+    def _check_consistency(
+        self,
+        goal: Any,
+        plan: Any,
+        result: Any,
+        issues: List[str],
+        warnings: List[str],
+        checks: Dict[str, bool],
+    ) -> None:
+        goal_data = self._as_dict(goal)
+        plan_data = self._as_dict(plan)
+        result_data = self._as_dict(result)
+
+        goal_target = self._clean_text(
+            goal_data.get("target")
+        )
+
+        result_target = self._clean_text(
+            result_data.get("target")
+        )
+
+        if (
+            goal_target
+            and result_target
+            and goal_target.lower()
+            != result_target.lower()
+        ):
+            issues.append(
+                "goal_result_target_mismatch"
+            )
+            checks["target_consistent"] = False
+        else:
+            checks["target_consistent"] = True
+
+        tasks = plan_data.get("tasks")
+
+        if isinstance(tasks, list):
+            goal_text = self._clean_text(
+                goal_data.get("text")
+            ).lower()
+
+            if goal_text and tasks:
+                checks["goal_plan_linked"] = True
+            else:
+                checks["goal_plan_linked"] = False
+        else:
+            checks["goal_plan_linked"] = False
+
+    # =========================================================
+    # VERDICT
+    # =========================================================
+
+    @staticmethod
+    def _build_verdict(
+        issues: List[str],
+        warnings: List[str],
+    ) -> str:
+        blocking_issues = {
+            "missing_goal",
+            "empty_goal_text",
+            "tasks_not_list",
+            "duplicate_task_ids",
+            "multiple_active_tasks",
+            "invalid_result_success_type",
+            "invalid_verification_structure",
+            "verification_success_conflict",
+            "goal_result_target_mismatch",
+        }
+
+        if any(
+            issue in blocking_issues
+            for issue in issues
+        ):
+            return "block"
+
+        if issues or warnings:
+            return "review"
+
+        return "pass"
+
+    # =========================================================
+    # PUBLIC API
+    # =========================================================
+
+    def evaluate(
+        self,
+        goal: Any = None,
+        plan: Any = None,
+        result: Any = None,
+    ) -> Dict[str, Any]:
+        """
+        Evaluate goal, plan and execution result.
+
+        Returns a new result dictionary.
+        Does not mutate input objects.
+        """
+
+        issues: List[str] = []
+        warnings: List[str] = []
+        checks: Dict[str, bool] = {}
+
+        self._check_goal(
+            goal,
+            issues,
+            warnings,
+            checks,
+        )
+
+        self._check_plan(
+            plan,
+            issues,
+            warnings,
+            checks,
+        )
+
+        self._check_result(
+            result,
+            issues,
+            warnings,
+            checks,
+        )
+
+        self._check_consistency(
+            goal,
+            plan,
+            result,
+            issues,
+            warnings,
+            checks,
+        )
+
+        verdict = self._build_verdict(
+            issues,
+            warnings,
+        )
+
+        valid = verdict != "block"
+
+        score = 1.0
+
+        score -= min(
+            0.15 * len(warnings),
+            0.45,
+        )
+
+        score -= min(
+            0.30 * len(issues),
+            1.0,
+        )
+
+        score = max(
+            0.0,
+            min(1.0, score),
+        )
+
+        result_data = {
+            "verdict": verdict,
+            "valid": valid,
+            "score": score,
+            "issues": list(issues),
+            "warnings": list(warnings),
+            "checks": deepcopy(checks),
+            "goal": deepcopy(goal),
+            "plan": deepcopy(plan),
+            "result": deepcopy(result),
+            "reason": (
+                "Critic evaluation completed."
+                if verdict == "pass"
+                else (
+                    "Review required."
+                    if verdict == "review"
+                    else "Blocking issue detected."
+                )
+            ),
+            "version": self.VERSION,
+        }
+
+        self.last_result = deepcopy(
+            result_data
+        )
+
+        return deepcopy(
+            result_data
+        )
+
+    def get_last_result(
+        self,
+    ) -> Optional[Dict[str, Any]]:
+        if self.last_result is None:
+            return None
+
+        return deepcopy(
+            self.last_result
+        )
+
+    def reset(self) -> None:
+        self.last_result = None
+
+    def validate(self) -> Dict[str, Any]:
+        return {
+            "valid": True,
+            "version": self.VERSION,
+            "last_result_present": (
+                self.last_result is not None
+            ),
+            "supported_verdicts": sorted(
+                self.VALID_VERDICTS
+            ),
+        }
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "version": self.VERSION,
+            "valid": True,
+            "last_result": deepcopy(
+                self.last_result
+            ),
+        }
+
+
+def create_critic() -> Critic:
+    return Critic()
+
+
+def self_check() -> Dict[str, Any]:
+    critic = Critic()
+
+    valid_goal = {
+        "text": "mở youtube",
+        "intent": "action",
+        "action": "open",
+        "target": "youtube",
+    }
+
+    valid_plan = {
+        "goal": valid_goal,
+        "tasks": [
+            {
+                "id": "task_1",
+                "description": "Open youtube",
+                "status": "planned",
+            }
+        ],
+    }
+
+    valid_result = {
+        "success": True,
+        "target": "youtube",
+        "verification": {
+            "verified": True,
+            "status": "pass",
+            "success": True,
+        },
+    }
+
+    result = critic.evaluate(
+        valid_goal,
+        valid_plan,
+        valid_result,
+    )
+
+    return {
+        "version": critic.VERSION,
+        "valid": (
+            result.get("verdict")
+            in Critic.VALID_VERDICTS
+            and isinstance(
+                result.get("checks"),
+                dict,
+            )
+            and isinstance(
+                result.get("issues"),
+                list,
+            )
+            and isinstance(
+                result.get("warnings"),
+                list,
+            )
+        ),
+        "verdict": result.get(
+            "verdict"
+        ),
+        "issues": result.get(
+            "issues"
+        ),
+        "warnings": result.get(
+            "warnings"
+        ),
+    }
+
+
+if __name__ == "__main__":
+    print(
+        "=== P9-1 CRITIC CORE SELF CHECK ==="
+    )
+
+    result = self_check()
+
+    print(
+        "VERSION:",
+        result["version"],
+    )
+
+    print(
+        "VERDICT:",
+        result["verdict"],
+    )
+
+    print(
+        "VALID:",
+        result["valid"],
+    )
+
+    if result["issues"]:
+        print(
+            "ISSUES:",
+            result["issues"],
+        )
+
+    if result["warnings"]:
+        print(
+            "WARNINGS:",
+            result["warnings"],
+        )
+
+    if result["valid"]:
+        print(
+            "P9-1 CRITIC CORE: PASS"
+        )
+    else:
+        raise SystemExit(
+            "P9-1 CRITIC CORE: FAIL"
+        )

@@ -25,7 +25,6 @@ from __future__ import annotations
 
 from tool_selector import create_tool_selector
 from observer import create_observer
-from lifecycle import create_execution_lifecycle
 
 from pathlib import Path
 from datetime import datetime
@@ -2112,13 +2111,6 @@ class MinhMiniCore:
             log("P12 OBSERVER INIT ERROR: " + repr(exc))
 
         self.last_execution_observation = None
-        # P12-3 EXECUTION LIFECYCLE INIT
-        try:
-            self.execution_lifecycle = create_execution_lifecycle()
-        except Exception as exc:
-            self.execution_lifecycle = None
-            log("P12-3 LIFECYCLE INIT ERROR: " + repr(exc))
-        self.last_execution_lifecycle = None
 
         # THINK_X_P32_INIT
         try:
@@ -4084,25 +4076,9 @@ class MinhMiniCore:
                 + traceback.format_exc()
             )
 
-        # P12-3 LIFECYCLE: PREPARE
-        try:
-            lifecycle = getattr(
-                self,
-                "execution_lifecycle",
-                None,
-            )
-            if lifecycle is not None:
-                lifecycle.reset()
-            self._p12_3_lifecycle_stage("prepare")
-        except Exception as exc:
-            log("P12-3 PREPARE ERROR: " + repr(exc))
-
         # ----------------------------------------------------
         # 5. EXECUTION
         # ----------------------------------------------------
-
-        # P12-3 LIFECYCLE: EXECUTE
-        self._p12_3_lifecycle_stage("execute")
 
         answer, execution_result = (
             self.execute_decision(
@@ -4110,9 +4086,6 @@ class MinhMiniCore:
                 decision,
             )
         )
-
-        # P12-3 LIFECYCLE: OBSERVE
-        self._p12_3_lifecycle_stage("observe")
 
         # P12-1 EXECUTE -> OBSERVE
         observation = None
@@ -4152,9 +4125,6 @@ class MinhMiniCore:
                 "P12 OBSERVE ERROR: "
                 + traceback.format_exc()
             )
-
-        # P12-3 LIFECYCLE: VERIFY
-        self._p12_3_lifecycle_stage("verify")
 
         # P45_EXECUTION_VERIFY
         verification = None
@@ -4461,17 +4431,6 @@ class MinhMiniCore:
                 + repr(exc)
             )
 
-
-        # P12-3 LIFECYCLE FINALIZE
-        try:
-            self._p12_3_finalize_lifecycle(
-                verification=verification,
-                execution_result=execution_result,
-                decision=decision,
-            )
-        except Exception as exc:
-            log("P12-3 FINALIZE ERROR: " + repr(exc))
-
         # ----------------------------------------------------
         # P10-4 EVALUATION — ADVISORY ONLY
         try:
@@ -4733,147 +4692,6 @@ class MinhMiniCore:
     # Judge -> Tool Selector -> Execute
     # SELECT ONLY; NEVER EXECUTE FROM SELECTOR
     # --------------------------------------------------------
-
-    # --------------------------------------------------------
-    # P12-3 EXECUTION LIFECYCLE
-    # Tracks prepare -> execute -> observe -> verify.
-    # SELECT/OBSERVE/LIFECYCLE NEVER EXECUTE TOOLS.
-    # --------------------------------------------------------
-    def _p12_3_lifecycle_stage(self, stage):
-        lifecycle = getattr(
-            self,
-            "execution_lifecycle",
-            None,
-        )
-
-        if lifecycle is None:
-            return {
-                "stage": str(stage or ""),
-                "recorded": False,
-                "error": "lifecycle_unavailable",
-                "version": "P12-3.0",
-            }
-
-        try:
-            return lifecycle.record(stage)
-        except Exception as exc:
-            log(
-                "P12-3 LIFECYCLE ERROR: "
-                + repr(exc)
-            )
-            return {
-                "stage": str(stage or ""),
-                "recorded": False,
-                "error": repr(exc),
-                "version": "P12-3.0",
-            }
-
-    def _p12_3_finalize_lifecycle(
-        self,
-        verification=None,
-        execution_result=None,
-        decision=None,
-    ):
-        lifecycle = getattr(
-            self,
-            "execution_lifecycle",
-            None,
-        )
-
-        if lifecycle is None:
-            result = {
-                "status": "review",
-                "stages": [],
-                "completed_stages": [],
-                "failed_stage": "",
-                "verified": None,
-                "success": None,
-                "tool": "",
-                "intent": "",
-                "checks": [
-                    "lifecycle_unavailable",
-                ],
-                "version": "P12-3.0",
-            }
-            self.last_execution_lifecycle = result
-            return result
-
-        try:
-            verified = get_decision_value(
-                verification,
-                "verified",
-                None,
-            )
-
-            success = get_decision_value(
-                execution_result,
-                "success",
-                None,
-            )
-
-            tool = get_decision_value(
-                execution_result,
-                "tool",
-                get_decision_value(
-                    decision,
-                    "tool",
-                    "",
-                ),
-            )
-
-            intent = get_decision_value(
-                execution_result,
-                "intent",
-                get_decision_value(
-                    decision,
-                    "intent",
-                    "",
-                ),
-            )
-
-            error = get_decision_value(
-                execution_result,
-                "error",
-                "",
-            )
-
-            result = lifecycle.finalize(
-                verified=verified,
-                success=success,
-                tool=tool,
-                intent=intent,
-                error=error,
-            )
-
-            self.last_execution_lifecycle = result
-            return result
-
-        except Exception as exc:
-            result = {
-                "status": "review",
-                "stages": [],
-                "completed_stages": [],
-                "failed_stage": "",
-                "verified": None,
-                "success": None,
-                "tool": "",
-                "intent": "",
-                "checks": [
-                    "lifecycle_finalize_exception",
-                ],
-                "error": repr(exc),
-                "version": "P12-3.0",
-            }
-
-            self.last_execution_lifecycle = result
-
-            log(
-                "P12-3 LIFECYCLE FINALIZE ERROR: "
-                + repr(exc)
-            )
-
-            return result
-
     def _p12_2_prepare_tool_selection(
         self,
         message=None,

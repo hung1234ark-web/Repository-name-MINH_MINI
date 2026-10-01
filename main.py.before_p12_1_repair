@@ -24,8 +24,6 @@
 from __future__ import annotations
 
 from tool_selector import create_tool_selector
-from observer import create_observer
-from lifecycle import create_execution_lifecycle
 
 from pathlib import Path
 from datetime import datetime
@@ -2104,22 +2102,6 @@ class MinhMiniCore:
         self.tool_selector = create_tool_selector()
         self.last_p11_tool_selection = None
 
-        # P12-1 OBSERVER INIT
-        try:
-            self.observer = create_observer()
-        except Exception as exc:
-            self.observer = None
-            log("P12 OBSERVER INIT ERROR: " + repr(exc))
-
-        self.last_execution_observation = None
-        # P12-3 EXECUTION LIFECYCLE INIT
-        try:
-            self.execution_lifecycle = create_execution_lifecycle()
-        except Exception as exc:
-            self.execution_lifecycle = None
-            log("P12-3 LIFECYCLE INIT ERROR: " + repr(exc))
-        self.last_execution_lifecycle = None
-
         # THINK_X_P32_INIT
         try:
             from think_x import create_think_x
@@ -4042,67 +4024,8 @@ class MinhMiniCore:
             return answer
 
         # ----------------------------------------------------
-        # P12-2 JUDGE -> TOOL SELECTOR -> EXECUTE
-        # Tool selection MUST happen before execution.
-        # Selector is advisory/select-only.
-        # Existing decision + contract gate remain authoritative.
-        # ----------------------------------------------------
-        p12_2_tool_selection = None
-
-        try:
-            p12_2_tool_selection = (
-                self._p12_2_prepare_tool_selection(
-                    message=completed,
-                    decision=decision,
-                    result=getattr(
-                        self,
-                        "last_p10_evaluation",
-                        None,
-                    ),
-                )
-            )
-        except Exception as exc:
-            p12_2_tool_selection = {
-                "tool": None,
-                "reason": "bridge_exception",
-                "confidence": 0.0,
-                "allowed": False,
-                "advisory_only": True,
-                "version": "P12-2.0",
-                "checks": [
-                    "bridge_exception",
-                ],
-                "error": repr(exc),
-            }
-
-            self.last_p11_tool_selection = (
-                p12_2_tool_selection
-            )
-
-            log(
-                "P12-2 TOOL BRIDGE ERROR: "
-                + traceback.format_exc()
-            )
-
-        # P12-3 LIFECYCLE: PREPARE
-        try:
-            lifecycle = getattr(
-                self,
-                "execution_lifecycle",
-                None,
-            )
-            if lifecycle is not None:
-                lifecycle.reset()
-            self._p12_3_lifecycle_stage("prepare")
-        except Exception as exc:
-            log("P12-3 PREPARE ERROR: " + repr(exc))
-
-        # ----------------------------------------------------
         # 5. EXECUTION
         # ----------------------------------------------------
-
-        # P12-3 LIFECYCLE: EXECUTE
-        self._p12_3_lifecycle_stage("execute")
 
         answer, execution_result = (
             self.execute_decision(
@@ -4110,51 +4033,6 @@ class MinhMiniCore:
                 decision,
             )
         )
-
-        # P12-3 LIFECYCLE: OBSERVE
-        self._p12_3_lifecycle_stage("observe")
-
-        # P12-1 EXECUTE -> OBSERVE
-        observation = None
-
-        try:
-            observer = getattr(
-                self,
-                "_p12_observe_execution",
-                None,
-            )
-
-            if callable(observer):
-                observation = observer(
-                    message=completed,
-                    decision=decision,
-                    execution_result=execution_result,
-                    answer=answer,
-                )
-
-        except Exception as exc:
-            observation = {
-                "observed": False,
-                "success": None,
-                "tool": "",
-                "intent": "",
-                "answer": str(answer or ""),
-                "error": repr(exc),
-                "checks": [
-                    "observation_exception",
-                ],
-                "version": "P12-1.0",
-            }
-
-            self.last_execution_observation = observation
-
-            log(
-                "P12 OBSERVE ERROR: "
-                + traceback.format_exc()
-            )
-
-        # P12-3 LIFECYCLE: VERIFY
-        self._p12_3_lifecycle_stage("verify")
 
         # P45_EXECUTION_VERIFY
         verification = None
@@ -4461,17 +4339,6 @@ class MinhMiniCore:
                 + repr(exc)
             )
 
-
-        # P12-3 LIFECYCLE FINALIZE
-        try:
-            self._p12_3_finalize_lifecycle(
-                verification=verification,
-                execution_result=execution_result,
-                decision=decision,
-            )
-        except Exception as exc:
-            log("P12-3 FINALIZE ERROR: " + repr(exc))
-
         # ----------------------------------------------------
         # P10-4 EVALUATION — ADVISORY ONLY
         try:
@@ -4507,17 +4374,33 @@ class MinhMiniCore:
                     None,
                 )
 
-            # P11 TOOL SELECTOR
-            # P12-2 moved authoritative pre-execution
-            # selection to the execution bridge.
+            # P11 TOOL SELECTOR — ADVISORY / SELECT ONLY
+            _p11_tool_selection = self._p11_select_tool(
+                goal=_p10_goal,
+                plan=_p10_plan,
+                decision=None,
+                result=_p10_result,
+            )
             self._p10_4_run_evaluation(
                 goal=_p10_goal,
                 plan=_p10_plan,
                 result=_p10_result,
             )
-            # P11-2 compatibility record.
-            # Actual pre-execution selection is performed
-            # by P12-2 immediately before execute_decision().
+            # P11-2 TOOL SELECTOR <- P10 JUDGE DECISION
+            _p11_2_evaluation = getattr(self, "last_p10_evaluation", None)
+            _p11_2_judge = {}
+            if isinstance(_p11_2_evaluation, dict):
+                _p11_2_judge = _p11_2_evaluation.get("judge", {})
+            _p11_2_decision = None
+            if isinstance(_p11_2_judge, dict):
+                _p11_2_decision = _p11_2_judge.get("decision")
+            _p11_2_tool_selection = self._p11_select_tool(
+                goal=None,
+                plan=None,
+                decision=_p11_2_decision,
+                result=_p11_2_evaluation,
+            )
+            self.last_p11_tool_selection = _p11_2_tool_selection
         except Exception:
             self.last_p10_evaluation = None
 
@@ -4646,386 +4529,6 @@ class MinhMiniCore:
 
 
     # P11 TOOL SELECTOR — SELECT ONLY
-    # --------------------------------------------------------
-    # P12-1 OBSERVER
-    # --------------------------------------------------------
-
-    def _p12_observe_execution(
-        self,
-        message=None,
-        decision=None,
-        execution_result=None,
-        answer="",
-    ):
-        observer = getattr(
-            self,
-            "observer",
-            None,
-        )
-
-        if observer is None:
-            observation = {
-                "observed": False,
-                "success": None,
-                "tool": "",
-                "intent": "",
-                "answer": str(answer or ""),
-                "error": "observer_unavailable",
-                "raw_type": (
-                    type(execution_result).__name__
-                    if execution_result is not None
-                    else "NoneType"
-                ),
-                "checks": [
-                    "observer_unavailable",
-                ],
-                "version": "P12-1.0",
-            }
-
-            self.last_execution_observation = observation
-            return observation
-
-        try:
-            observation = observer.observe(
-                message=message or "",
-                decision=decision,
-                execution_result=execution_result,
-                answer=answer or "",
-            )
-
-            self.last_execution_observation = observation
-
-            return observation
-
-        except Exception as exc:
-
-            observation = {
-                "observed": False,
-                "success": None,
-                "tool": "",
-                "intent": "",
-                "answer": str(answer or ""),
-                "error": repr(exc),
-                "raw_type": (
-                    type(execution_result).__name__
-                    if execution_result is not None
-                    else "NoneType"
-                ),
-                "checks": [
-                    "observation_exception",
-                ],
-                "version": "P12-1.0",
-            }
-
-            self.last_execution_observation = observation
-
-            log(
-                "P12 OBSERVE ERROR: "
-                + traceback.format_exc()
-            )
-
-            return observation
-
-
-
-    # --------------------------------------------------------
-    # P12-2 TOOL SELECTION BRIDGE
-    # Judge -> Tool Selector -> Execute
-    # SELECT ONLY; NEVER EXECUTE FROM SELECTOR
-    # --------------------------------------------------------
-
-    # --------------------------------------------------------
-    # P12-3 EXECUTION LIFECYCLE
-    # Tracks prepare -> execute -> observe -> verify.
-    # SELECT/OBSERVE/LIFECYCLE NEVER EXECUTE TOOLS.
-    # --------------------------------------------------------
-    def _p12_3_lifecycle_stage(self, stage):
-        lifecycle = getattr(
-            self,
-            "execution_lifecycle",
-            None,
-        )
-
-        if lifecycle is None:
-            return {
-                "stage": str(stage or ""),
-                "recorded": False,
-                "error": "lifecycle_unavailable",
-                "version": "P12-3.0",
-            }
-
-        try:
-            return lifecycle.record(stage)
-        except Exception as exc:
-            log(
-                "P12-3 LIFECYCLE ERROR: "
-                + repr(exc)
-            )
-            return {
-                "stage": str(stage or ""),
-                "recorded": False,
-                "error": repr(exc),
-                "version": "P12-3.0",
-            }
-
-    def _p12_3_finalize_lifecycle(
-        self,
-        verification=None,
-        execution_result=None,
-        decision=None,
-    ):
-        lifecycle = getattr(
-            self,
-            "execution_lifecycle",
-            None,
-        )
-
-        if lifecycle is None:
-            result = {
-                "status": "review",
-                "stages": [],
-                "completed_stages": [],
-                "failed_stage": "",
-                "verified": None,
-                "success": None,
-                "tool": "",
-                "intent": "",
-                "checks": [
-                    "lifecycle_unavailable",
-                ],
-                "version": "P12-3.0",
-            }
-            self.last_execution_lifecycle = result
-            return result
-
-        try:
-            verified = get_decision_value(
-                verification,
-                "verified",
-                None,
-            )
-
-            success = get_decision_value(
-                execution_result,
-                "success",
-                None,
-            )
-
-            tool = get_decision_value(
-                execution_result,
-                "tool",
-                get_decision_value(
-                    decision,
-                    "tool",
-                    "",
-                ),
-            )
-
-            intent = get_decision_value(
-                execution_result,
-                "intent",
-                get_decision_value(
-                    decision,
-                    "intent",
-                    "",
-                ),
-            )
-
-            error = get_decision_value(
-                execution_result,
-                "error",
-                "",
-            )
-
-            result = lifecycle.finalize(
-                verified=verified,
-                success=success,
-                tool=tool,
-                intent=intent,
-                error=error,
-            )
-
-            self.last_execution_lifecycle = result
-            return result
-
-        except Exception as exc:
-            result = {
-                "status": "review",
-                "stages": [],
-                "completed_stages": [],
-                "failed_stage": "",
-                "verified": None,
-                "success": None,
-                "tool": "",
-                "intent": "",
-                "checks": [
-                    "lifecycle_finalize_exception",
-                ],
-                "error": repr(exc),
-                "version": "P12-3.0",
-            }
-
-            self.last_execution_lifecycle = result
-
-            log(
-                "P12-3 LIFECYCLE FINALIZE ERROR: "
-                + repr(exc)
-            )
-
-            return result
-
-    def _p12_2_prepare_tool_selection(
-        self,
-        message=None,
-        decision=None,
-        result=None,
-    ):
-        """
-        Prepare the P11 tool selection before execution.
-
-        Safety contract:
-        - P11 selector does not execute anything.
-        - Existing decision remains authoritative.
-        - A selector mismatch is recorded, not guessed away.
-        - Execution Contract / clarification gate remains authoritative.
-        """
-
-        selection = None
-
-        try:
-            selector = getattr(
-                self,
-                "tool_selector",
-                None,
-            )
-
-            if selector is None:
-                selection = {
-                    "tool": None,
-                    "reason": "tool_selector_unavailable",
-                    "confidence": 0.0,
-                    "allowed": False,
-                    "advisory_only": True,
-                    "version": "P12-2.0",
-                    "checks": [
-                        "selector_unavailable",
-                    ],
-                }
-
-                self.last_p11_tool_selection = selection
-                return selection
-
-            decision_tool = get_decision_value(
-                decision,
-                "tool",
-                "",
-            )
-
-            decision_intent = get_decision_value(
-                decision,
-                "intent",
-                "",
-            )
-
-            selection = self._p11_select_tool(
-                goal=message,
-                plan=None,
-                decision=decision,
-                result=result,
-            )
-
-            if not isinstance(selection, dict):
-                selection = {
-                    "tool": None,
-                    "reason": "invalid_selector_result",
-                    "confidence": 0.0,
-                    "allowed": False,
-                    "advisory_only": True,
-                    "version": "P12-2.0",
-                    "checks": [
-                        "invalid_selector_result",
-                    ],
-                }
-
-            selected_tool = str(
-                selection.get("tool") or ""
-            ).strip()
-
-            selection = dict(selection)
-
-            selection["decision_tool"] = (
-                str(decision_tool or "").strip()
-            )
-
-            selection["decision_intent"] = (
-                str(decision_intent or "").strip()
-            )
-
-            if selected_tool and decision_tool:
-                selection["tool_match"] = (
-                    selected_tool == str(
-                        decision_tool
-                    ).strip()
-                )
-            else:
-                selection["tool_match"] = True
-
-            if (
-                selected_tool
-                and decision_tool
-                and selected_tool != str(
-                    decision_tool
-                ).strip()
-            ):
-                selection["checks"] = list(
-                    selection.get("checks") or []
-                )
-                selection["checks"].append(
-                    "tool_mismatch"
-                )
-                selection["reason"] = (
-                    str(
-                        selection.get("reason")
-                        or ""
-                    )
-                    + " | decision_tool="
-                    + str(decision_tool)
-                    + " | selected_tool="
-                    + selected_tool
-                )
-
-            selection["advisory_only"] = True
-            selection["bridge_version"] = (
-                "P12-2.0"
-            )
-
-            self.last_p11_tool_selection = selection
-
-            return selection
-
-        except Exception as exc:
-            selection = {
-                "tool": None,
-                "reason": "tool_selection_exception",
-                "confidence": 0.0,
-                "allowed": False,
-                "advisory_only": True,
-                "version": "P12-2.0",
-                "checks": [
-                    "tool_selection_exception",
-                ],
-                "error": repr(exc),
-            }
-
-            self.last_p11_tool_selection = selection
-
-            log(
-                "P12-2 TOOL SELECTION ERROR: "
-                + repr(exc)
-            )
-
-            return selection
-
     def _p11_select_tool(self, goal=None, plan=None, decision=None, result=None):
         selector = getattr(self, "tool_selector", None)
         if selector is None:
