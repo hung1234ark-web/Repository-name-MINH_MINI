@@ -83,6 +83,7 @@ action = safe_import("action")
 web = safe_import("web")
 web_ai = safe_import("web_ai")
 web_context = safe_import("web_context")
+agent_reach_adapter = safe_import("agent_reach_adapter")
 
 
 chat_module = safe_import("chat")
@@ -1801,6 +1802,7 @@ def self_check() -> dict[str, Any]:
         "web": web,
         "web_ai": web_ai,
         "web_context": web_context,
+        "agent_reach_adapter": agent_reach_adapter,
     }
 
     result = {}
@@ -1986,6 +1988,21 @@ class MinhMiniCore:
         # EXECUTION_CONTRACT_P44_LAST_RESULT_INIT
         self.last_execution_contract = None
 
+        # AGENT_REACH_INIT
+        # Agent Reach is integrated as a capability-discovery/read-only layer.
+        # It does not execute Windows actions or override the existing controller.
+        try:
+            self.agent_reach = (
+                agent_reach_adapter.get_adapter()
+                if agent_reach_adapter is not None
+                else None
+            )
+        except Exception as exc:
+            self.agent_reach = None
+            log("AGENT REACH INIT ERROR: " + repr(exc))
+
+        self.last_agent_reach_status = None
+
         # P45_EXECUTION_VERIFY_INIT
         self.last_execution_verification = None
         self.last_execution_contract = None
@@ -2021,6 +2038,12 @@ class MinhMiniCore:
             "web_context": (
                 web_context is not None
             ),
+            "agent_reach_adapter": (
+                self.agent_reach is not None
+            ),
+            "agent_reach_executable": (
+                bool(getattr(self.agent_reach, "executable", None))
+            ),
             "memory_items": len(
                 MEMORY.get(
                     "items",
@@ -2047,6 +2070,34 @@ class MinhMiniCore:
             "development_support_execution": False,
 "debate_execution": False,
         }
+
+    # --------------------------------------------------------
+    # AGENT REACH
+    # --------------------------------------------------------
+
+    def agent_reach_status(self) -> dict[str, Any]:
+        """Return the real Agent Reach doctor capability registry."""
+        adapter = getattr(self, "agent_reach", None)
+        if adapter is None:
+            return {
+                "available": False,
+                "error": "adapter_unavailable",
+            }
+        try:
+            result = adapter.capability_status()
+            self.last_agent_reach_status = result
+            return {
+                "available": bool(result.success),
+                "message": result.message,
+                "error": result.error,
+                "data": result.data,
+            }
+        except Exception as exc:
+            log("AGENT REACH STATUS ERROR: " + repr(exc))
+            return {
+                "available": False,
+                "error": repr(exc),
+            }
 
     # --------------------------------------------------------
     # DEBATE
