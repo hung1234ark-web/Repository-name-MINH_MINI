@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 from tool_selector import create_tool_selector
+from agent_delegator import create_agent_delegator
 from observer import create_observer
 from lifecycle import create_execution_lifecycle
 try:
@@ -1758,6 +1759,20 @@ def guard_answer(
 # HANDLER MAP
 # ============================================================
 
+def handle_gemini(message: str = "", **kwargs: Any) -> str:
+    """Gemini bridge handler; never exposes credentials."""
+    try:
+        from gemini_bridge import ask
+        prompt = clean_text(message)
+        result = ask(prompt)
+        if isinstance(result, dict) and result.get("ok"):
+            return clean_text(result.get("text", ""))
+        return ""
+    except Exception as exc:
+        log("GEMINI HANDLER ERROR: " + repr(exc))
+        return ""
+
+
 def build_handlers() -> dict[str, Any]:
 
     return {
@@ -1770,6 +1785,7 @@ def build_handlers() -> dict[str, Any]:
         "date": lambda **kwargs: current_date(),
         "chat": chat_module.handle_chat,
         "ollama": chat_module.handle_chat,
+        "gemini": handle_gemini,
     }
 
 def process(
@@ -2112,6 +2128,14 @@ class MinhMiniCore:
         # P11 TOOL SELECTOR — SELECT ONLY
         self.tool_selector = create_tool_selector()
         self.last_p11_tool_selection = None
+
+        # P14 AGENT DELEGATION — ASSIGN ONLY
+        try:
+            self.agent_delegator = create_agent_delegator()
+        except Exception as exc:
+            self.agent_delegator = None
+            log("P14 AGENT DELEGATOR INIT ERROR: " + repr(exc))
+        self.last_agent_assignment = None
 
         # P12-1 OBSERVER INIT
         try:
@@ -3397,6 +3421,25 @@ class MinhMiniCore:
         decision: Any,
     ) -> tuple[str, Any]:
 
+        # P13-2 EXECUTION BOUNDARY: a recovery result may describe a
+        # replan/reselect/clarify path, but it never authorizes automatic
+        # re-execution. A new authorization must be established by the
+        # normal planning flow before another execution attempt.
+        recovery_gate = getattr(self, "last_p13_recovery_gate", None)
+        if isinstance(recovery_gate, dict):
+            if recovery_gate.get("allowed_to_execute") is False:
+                return "", {
+                    "success": False,
+                    "tool": "recovery_gate",
+                    "intent": "recovery_blocked",
+                    "execution_blocked": True,
+                    "reason": recovery_gate.get(
+                        "reason",
+                        "recovery_gate_denied",
+                    ),
+                    "recovery_gate": dict(recovery_gate),
+                }
+
         intent = clean_text(
             get_decision_value(
                 decision,
@@ -3551,9 +3594,22 @@ class MinhMiniCore:
             build_chat_context(),
         )
 
-        return answer, {
-            "success": bool(answer),
-            "tool": "ollama",
+        if answer:
+            return answer, {
+                "success": True,
+                "tool": "ollama",
+                "intent": intent or "chat",
+            }
+
+        # Gemini fallback: use the verified external bridge only when
+        # the local Ollama path cannot produce an answer.
+        gemini_answer = handle_gemini(
+            message=message,
+        )
+
+        return gemini_answer, {
+            "success": bool(gemini_answer),
+            "tool": "gemini" if gemini_answer else "ollama",
             "intent": intent or "chat",
         }
 
@@ -3574,6 +3630,10 @@ class MinhMiniCore:
             return (
                 "Lam chưa nhập nội dung gì."
             )
+
+        # A previous turn's P13-2 result must not leak into a new user turn.
+        # Re-authorization is rebuilt by the normal planning flow.
+        self.last_p13_recovery_gate = None
 
         # DEBATE_1_1_GATE
         # Bat /debate truoc COMMAND COMPLETION va BRAIN.
@@ -4550,7 +4610,7 @@ class MinhMiniCore:
                 "allowed_to_execute": False,
                 "reason": "p13_2_exception",
                 "checks": ["p13_2_exception"],
-                "version": "P13-2.0",
+                "version": "P13-2.1",
             }
             log(
                 "P13-2 RECOVERY GATE ERROR: "
@@ -5084,6 +5144,14 @@ class MinhMiniCore:
                 "P12-2.0"
             )
 
+            assignment = self._p14_assign_agent(
+                task=message,
+                intent=decision_intent,
+                tool=selected_tool or decision_tool,
+            )
+            if assignment is not None:
+                selection["agent_assignment"] = assignment.to_dict()
+
             self.last_p11_tool_selection = selection
 
             return selection
@@ -5123,6 +5191,24 @@ class MinhMiniCore:
         )
         self.last_p11_tool_selection = selection
         return selection
+
+    def _p14_assign_agent(self, task="", intent="", tool=""):
+        delegator = getattr(self, "agent_delegator", None)
+        if delegator is None:
+            self.last_agent_assignment = None
+            return None
+        try:
+            assignment = delegator.assign(
+                task,
+                intent=intent,
+                tool=tool,
+            )
+            self.last_agent_assignment = assignment
+            return assignment
+        except Exception as exc:
+            self.last_agent_assignment = None
+            log("P14 AGENT DELEGATION ERROR: " + repr(exc))
+            return None
 
     def make_clarification(
         self,

@@ -1,18 +1,17 @@
 """MINH MINI P13.2 — Recovery Gate.
 
 Consumes the read-only P13-1 diagnosis/recovery/replan result and turns it into
-an explicit next-step gate. This layer never executes, retries, routes, calls
-Web/Ollama/Action, or mutates the task planner.
+an explicit next-step gate. This layer never executes, retries, routes,
+calls Web/Ollama/Action, or mutates the task planner.
 
-The gate exists to make recovery intent observable and to prevent accidental
-automatic re-execution.
+The gate is fail-closed: only a structurally valid P13 success may proceed.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from typing import Any
 
-VERSION = "P13-2.0"
+VERSION = "P13-2.1"
 VALID_DECISIONS = {"proceed", "clarify", "replan", "reselect_tool", "stop"}
 AUTO_EXECUTION_FORBIDDEN = True
 
@@ -37,6 +36,12 @@ class RecoveryGate:
     def _text(value: Any) -> str:
         return str(value or "").strip().lower()
 
+    @staticmethod
+    def _list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        return [value] if value else []
+
     def evaluate(self, p13_result: Any = None) -> dict[str, Any]:
         checks: list[str] = []
 
@@ -44,77 +49,67 @@ class RecoveryGate:
             status = self._text(p13_result.get("status"))
             recovery = self._text(p13_result.get("recovery"))
             diagnosis = self._text(p13_result.get("diagnosis"))
-            replan = p13_result.get("replan", [])
+            replan = self._list(p13_result.get("replan", []))
         else:
             status = self._text(getattr(p13_result, "status", ""))
             recovery = self._text(getattr(p13_result, "recovery", ""))
             diagnosis = self._text(getattr(p13_result, "diagnosis", ""))
-            replan = getattr(p13_result, "replan", [])
-
-        if not isinstance(replan, list):
-            replan = [str(replan)] if replan else []
+            replan = self._list(getattr(p13_result, "replan", []))
 
         if not p13_result:
             checks.append("p13_result_missing")
             return RecoveryGateResult(
-                "stop",
-                "await_new_instruction",
-                False,
-                "No P13 recovery result is available.",
-                checks,
+                "stop", "await_new_instruction", False,
+                "No P13 recovery result is available.", checks,
             ).to_dict()
-
         checks.append("p13_result_present")
+
+        if status == "pass":
+            checks.append("p13_pass")
+            if recovery != "stop":
+                checks.append("success_recovery_invalid")
+                return RecoveryGateResult(
+                    "stop", "await_new_instruction", False,
+                    "P13 pass result has an invalid recovery state.", checks,
+                ).to_dict()
+            if replan:
+                checks.append("success_replan_not_empty")
+                return RecoveryGateResult(
+                    "stop", "await_new_instruction", False,
+                    "P13 pass result contains an unexpected replan.", checks,
+                ).to_dict()
+            checks.append("success_contract_valid")
+            return RecoveryGateResult(
+                "proceed", "continue_normal_flow", True,
+                "P13 detected no execution or verification failure.", checks,
+            ).to_dict()
 
         if recovery == "clarify":
             checks.append("clarification_required")
             return RecoveryGateResult(
-                "clarify",
-                "request_missing_information",
-                False,
-                diagnosis or "clarification_required",
-                checks,
+                "clarify", "request_missing_information", False,
+                diagnosis or "clarification_required", checks,
             ).to_dict()
 
         if recovery == "reselect_tool":
             checks.append("tool_reselection_required")
             return RecoveryGateResult(
-                "reselect_tool",
-                "reselect_tool_and_rebuild_contract",
-                False,
-                diagnosis or "tool_reselection_required",
-                checks,
+                "reselect_tool", "reselect_tool_and_rebuild_contract", False,
+                diagnosis or "tool_reselection_required", checks,
             ).to_dict()
 
         if recovery == "replan":
             checks.append("replan_required")
             return RecoveryGateResult(
-                "replan",
-                "apply_replan_after_new_authorization",
-                False,
-                diagnosis or "replan_required",
-                checks,
-            ).to_dict()
-
-        if status == "pass":
-            checks.append("p13_pass")
-            return RecoveryGateResult(
-                "proceed",
-                "continue_normal_flow",
-                True,
-                "P13 detected no execution or verification failure.",
-                checks,
+                "replan", "apply_replan_after_new_authorization", False,
+                diagnosis or "replan_required", checks,
             ).to_dict()
 
         checks.append("recovery_requires_stop")
         return RecoveryGateResult(
-            "stop",
-            "await_new_instruction",
-            False,
-            diagnosis or "recovery_not_authorized",
-            checks,
+            "stop", "await_new_instruction", False,
+            diagnosis or "recovery_not_authorized", checks,
         ).to_dict()
-
     def validate(self) -> dict[str, Any]:
         sample = self.evaluate({
             "status": "review",
@@ -122,16 +117,37 @@ class RecoveryGate:
             "recovery": "replan",
             "replan": ["adjust_plan"],
         })
+        success = self.evaluate({
+            "status": "pass",
+            "diagnosis": "no_failure_detected",
+            "recovery": "stop",
+            "replan": [],
+        })
+        invalid_success = self.evaluate({
+            "status": "pass",
+            "diagnosis": "no_failure_detected",
+            "recovery": "unexpected",
+            "replan": [],
+        })
+        invalid_success_clarify = self.evaluate({
+            "status": "pass",
+            "diagnosis": "no_failure_detected",
+            "recovery": "clarify",
+            "replan": [],
+        })
+        invalid_success_replan = self.evaluate({
+            "status": "pass",
+            "diagnosis": "no_failure_detected",
+            "recovery": "replan",
+            "replan": ["unexpected"],
+        })
         checks = {
             "version": self.VERSION == VERSION,
             "result_shape": all(
                 key in sample
                 for key in (
-                    "decision",
-                    "action_required",
-                    "allowed_to_execute",
-                    "reason",
-                    "checks",
+                    "decision", "action_required",
+                    "allowed_to_execute", "reason", "checks",
                 )
             ),
             "decision_valid": sample["decision"] in VALID_DECISIONS,
@@ -139,6 +155,22 @@ class RecoveryGate:
                 sample["allowed_to_execute"] is False
             ),
             "auto_execution_forbidden": AUTO_EXECUTION_FORBIDDEN,
+            "valid_success_proceeds": (
+                success["decision"] == "proceed"
+                and success["allowed_to_execute"] is True
+            ),
+            "invalid_success_stops": (
+                invalid_success["decision"] == "stop"
+                and invalid_success["allowed_to_execute"] is False
+            ),
+            "pass_clarify_stops": (
+                invalid_success_clarify["decision"] == "stop"
+                and invalid_success_clarify["allowed_to_execute"] is False
+            ),
+            "pass_replan_stops": (
+                invalid_success_replan["decision"] == "stop"
+                and invalid_success_replan["allowed_to_execute"] is False
+            ),
         }
         return {
             "valid": all(checks.values()),
